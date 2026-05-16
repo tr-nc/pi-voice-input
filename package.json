@@ -1,13 +1,14 @@
 {
-  "name": "pi-voice-input-volc-asr",
+  "name": "pi-voice-input",
   "version": "0.1.0",
-  "description": "pi extension for fast voice input using Volcengine/Doubao WebSocket ASR",
+  "description": "provider-extensible voice input extension for pi",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
     "voice-input",
-    "volcengine",
+    "speech-to-text",
+    "dictation",
     "asr"
   ],
   "license": "MIT",

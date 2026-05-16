@@ -1,11 +1,13 @@
-# pi Voice Input for Volcengine ASR
+# pi Voice Input
 
-A publishable, pure TypeScript [pi](https://pi.dev/) extension for local voice input with Volcengine/Doubao ASR.
+A publishable, pure TypeScript [pi](https://pi.dev/) extension for local voice input.
 
 - Press `Ctrl+Shift+R` once to start recording.
 - Press `Ctrl+Shift+R` again to stop.
-- The extension sends the audio directly to Volcengine WebSocket ASR.
+- The extension sends the audio to an ASR provider.
 - The recognized text is inserted into pi's editor without submitting.
+
+The provider layer is intended to be extensible. **Current version supports only VolcEngine WebSocket ASR.**
 
 No Python, `uv`, upload service, or `ffmpeg` is required for normal shortcut usage.
 
@@ -19,8 +21,8 @@ pi extension: extensions/voice-input.ts
   │    └─ fallback: arecord
   ├─ records 16 kHz mono 16-bit WAV
   ├─ parses the WAV container in TypeScript and extracts raw PCM
-  ├─ sends PCM frames to Volcengine WebSocket ASR via ws
-  │    └─ default endpoint: /api/v3/sauc/bigmodel_nostream
+  ├─ sends PCM frames to the configured ASR provider via ws
+  │    └─ current provider: VolcEngine /api/v3/sauc/bigmodel_nostream
   └─ appends the final transcript to pi's editor with ctx.ui.setEditorText()
 ```
 
@@ -38,13 +40,13 @@ System dependency, one of:
 Install the published package with pi:
 
 ```bash
-pi install npm:pi-voice-input-volc-asr
+pi install npm:pi-voice-input
 ```
 
 To pin a specific version:
 
 ```bash
-pi install npm:pi-voice-input-volc-asr@0.1.0
+pi install npm:pi-voice-input@0.1.0
 ```
 
 If pi is already running, reload extensions after installation:
@@ -52,6 +54,19 @@ If pi is already running, reload extensions after installation:
 ```text
 /reload
 ```
+
+## Providers
+
+The extension is structured around a provider boundary: recording, editor insertion, and command handling are generic; ASR transport/protocol logic is provider-specific.
+
+Currently implemented provider:
+
+- VolcEngine WebSocket ASR (`bigmodel_nostream`)
+
+Planned provider direction:
+
+- add more ASR providers without changing the shortcut/user workflow
+- keep provider credentials and options isolated in config
 
 ## Configure credentials
 
@@ -89,7 +104,7 @@ Example:
 # Required
 VOLC_API_KEY=your_volcengine_speech_api_key
 
-# ASR endpoint and resource
+# Current provider: VolcEngine WebSocket ASR endpoint and resource
 VOLC_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream
 VOLC_STREAM_RESOURCE_ID=volc.seedasr.sauc.duration
 
@@ -157,7 +172,7 @@ Clone the repo and install dependencies:
 
 ```bash
 git clone <this-repo-url>
-cd pi-voice-input-volc-asr
+cd pi-voice-input
 npm install
 ```
 
