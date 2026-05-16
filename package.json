@@ -15,7 +15,7 @@
   "author": "tr-nc",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tr-nc/pi-voice-input.git"
+    "url": "git+https://github.com/tr-nc/pi-voice-input.git"
   },
   "bugs": {
     "url": "https://github.com/tr-nc/pi-voice-input/issues"
