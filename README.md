@@ -70,18 +70,18 @@ Planned provider direction:
 
 ## Configure credentials
 
-Create a config file:
+In pi, run:
 
-```bash
-mkdir -p ~/.pi/agent
-cp .env.example ~/.pi/agent/voice-input.env
-$EDITOR ~/.pi/agent/voice-input.env
+```text
+/voice key
 ```
 
-At minimum, set:
+Paste your VolcEngine Speech API key into the prompt. The extension saves it for future sessions and keeps it out of your project files.
 
-```bash
-VOLC_API_KEY=your_volcengine_speech_api_key
+Then verify:
+
+```text
+/voice config
 ```
 
 You can get/manage the key here:
@@ -90,18 +90,25 @@ https://console.volcengine.com/speech/new/setting/apikeys?projectName=default
 
 If `VOLC_API_KEY` is missing, the extension does not silently fail. It shows an error notification explaining:
 
-- that `VOLC_API_KEY` is missing
-- where to put it: `~/.pi/agent/voice-input.env`
-- the exact config line to add
-- the Volcengine API-key settings URL
+- that the current provider API key is missing
+- to run `/voice key`
+- the VolcEngine API-key settings URL
 - that `/voice config` can be used to verify detection
+
+Manual fallback:
+
+```bash
+mkdir -p ~/.pi/agent
+cp .env.example ~/.pi/agent/voice-input.env
+$EDITOR ~/.pi/agent/voice-input.env
+```
 
 ## Configuration reference
 
 Example:
 
 ```bash
-# Required
+# Required for the current provider. Usually set by /voice key.
 VOLC_API_KEY=your_volcengine_speech_api_key
 
 # Current provider: VolcEngine WebSocket ASR endpoint and resource
@@ -139,7 +146,7 @@ Config loading order, later values override earlier ones:
 3. current-working-directory `.env`
 4. shell environment variables
 
-Do not commit real credentials. Keep private local values in `.env` or `~/.pi/agent/voice-input.env`.
+Do not commit real credentials. Prefer `/voice key`, or keep private local values in `.env` or `~/.pi/agent/voice-input.env`.
 
 ## Usage
 
@@ -158,6 +165,7 @@ Slash commands:
 /voice cancel   # stop recording without transcribing
 /voice status   # show recorder state
 /voice config   # show effective non-secret config and whether API key is detected
+/voice key      # prompt for and save the current provider API key
 ```
 
 ## Notes

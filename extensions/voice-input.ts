@@ -3,6 +3,7 @@ import { Key } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -20,6 +21,7 @@ import WebSocket from "ws";
 
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(EXTENSION_DIR, "..");
+const PRIVATE_CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.env");
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
@@ -101,7 +103,7 @@ function parseEnvText(text: string): EnvMap {
 
 function loadEnvFiles(): EnvMap {
   const candidates = [
-    path.join(homedir(), ".pi", "agent", "voice-input.env"),
+    PRIVATE_CONFIG_PATH,
     path.join(PACKAGE_ROOT, ".env"),
     path.join(process.cwd(), ".env"),
   ];
@@ -183,6 +185,38 @@ function getConfig(): VoiceConfig {
 
 function ensureDir(dir: string) {
   mkdirSync(dir, { recursive: true });
+}
+
+function envValue(value: string): string {
+  if (/^[A-Za-z0-9_./:@+-]*$/.test(value)) return value;
+  return JSON.stringify(value);
+}
+
+function writePrivateEnvValue(name: string, value: string) {
+  if (/\r|\n/.test(value)) throw new Error(`${name} must be a single-line value`);
+  ensureDir(path.dirname(PRIVATE_CONFIG_PATH));
+
+  const original = existsSync(PRIVATE_CONFIG_PATH) ? readFileSync(PRIVATE_CONFIG_PATH, "utf8") : "";
+  const lines = original ? original.split(/\r?\n/) : [];
+  const replacement = `${name}=${envValue(value)}`;
+  let replaced = false;
+
+  const nextLines = lines.map((line) => {
+    if (new RegExp(`^\\s*${name}\\s*=`).test(line)) {
+      replaced = true;
+      return replacement;
+    }
+    return line;
+  });
+
+  if (!replaced) {
+    if (nextLines.length > 0 && nextLines[nextLines.length - 1] !== "") nextLines.push("");
+    nextLines.push("# Managed by pi-voice-input. You can also update this with /voice key.");
+    nextLines.push(replacement);
+  }
+
+  writeFileSync(PRIVATE_CONFIG_PATH, nextLines.join("\n").replace(/\n*$/, "\n"), { mode: 0o600 });
+  chmodSync(PRIVATE_CONFIG_PATH, 0o600);
 }
 
 function timestampForFilename(): string {
@@ -422,10 +456,8 @@ function parseRecordedWav(filePath: string): { pcm: Buffer; durationMs: number }
 
 function missingCredentialsMessage(): string {
   return [
-    "Missing VOLC_API_KEY for Volcengine ASR.",
-    "Create ~/.pi/agent/voice-input.env with:",
-    "  VOLC_API_KEY=your_volcengine_speech_api_key",
-    "Optional: copy .env.example from this package as a template.",
+    "Missing VOLC_API_KEY for the current VolcEngine ASR provider.",
+    "Run /voice key and paste your VolcEngine Speech API key.",
     "API key settings: https://console.volcengine.com/speech/new/setting/apikeys?projectName=default",
     "Run /voice config to verify whether the key is detected.",
   ].join("\n");
@@ -685,10 +717,32 @@ async function toggleRecording(ctx: ExtensionContext) {
   else await startRecording(ctx);
 }
 
+async function configureApiKey(ctx: ExtensionContext, providedKey = "") {
+  let apiKey = providedKey.trim();
+
+  if (!apiKey) {
+    if (!ctx.hasUI) {
+      ctx.ui.notify("Run /voice key in interactive pi, or set VOLC_API_KEY in the environment.", "error");
+      return;
+    }
+    const current = getConfig().apiKey;
+    const placeholder = current ? "Paste a new VolcEngine API key (current key is already set)" : "Paste VOLC_API_KEY";
+    apiKey = (await ctx.ui.input("VolcEngine API key", placeholder))?.trim() ?? "";
+  }
+
+  if (!apiKey) {
+    ctx.ui.notify("API key unchanged.", "warning");
+    return;
+  }
+
+  writePrivateEnvValue("VOLC_API_KEY", apiKey);
+  ctx.ui.notify("VolcEngine API key saved for pi voice input. Run /voice config to verify it is detected.", "info");
+}
+
 function configSummary(config: VoiceConfig): string {
   return [
     "Voice input config:",
-    `- api key: ${config.apiKey ? "set" : "missing"}`,
+    `- api key: ${config.apiKey ? "set" : "missing"} (update with /voice key)`,
     `- ws url: ${config.wsUrl}`,
     `- resource id: ${config.resourceId}`,
     `- language: ${config.language || "auto"}`,
@@ -697,6 +751,7 @@ function configSummary(config: VoiceConfig): string {
     `- recordings: ${config.recordingsDir}`,
     `- state: ${config.statePath}`,
     `- shortcut: ${config.shortcut}`,
+    "Run /voice key to save/update the current provider API key.",
     "Config files checked: ~/.pi/agent/voice-input.env, package .env, current .env; shell env overrides them.",
   ].join("\n");
 }
@@ -717,9 +772,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("voice", {
-    description: "Voice input: start | stop | status | toggle | cancel | config",
+    description: "Voice input: start | stop | status | toggle | cancel | config | key",
     handler: async (args, ctx) => {
-      const action = (args || "toggle").trim().toLowerCase();
+      const input = (args || "toggle").trim();
+      const action = (input.split(/\s+/, 1)[0] || "toggle").toLowerCase();
+      const rest = input.slice(action.length).trim();
       try {
         if (action === "start") {
           await startRecording(ctx);
@@ -743,11 +800,15 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(configSummary(getConfig()), "info");
           return;
         }
+        if (["key", "api-key", "apikey", "setup", "configure"].includes(action)) {
+          await configureApiKey(ctx, rest);
+          return;
+        }
         if (action === "toggle" || action === "") {
           await toggleRecording(ctx);
           return;
         }
-        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config", "error");
+        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config | key", "error");
       } catch (error) {
         ctx.ui.setStatus("voice-input", undefined);
         ctx.ui.notify(`Voice command error: ${error instanceof Error ? error.message : String(error)}`, "error");
