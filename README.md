@@ -43,18 +43,6 @@ Install the published package with pi:
 pi install npm:pi-voice-input
 ```
 
-To pin a specific version:
-
-```bash
-pi install npm:pi-voice-input@0.1.0
-```
-
-If pi is already running, reload extensions after installation:
-
-```text
-/reload
-```
-
 ## Providers
 
 The extension is structured around a provider boundary: recording, editor insertion, and command handling are generic; ASR transport/protocol logic is provider-specific.
@@ -78,81 +66,17 @@ In pi, run:
 
 Paste your VolcEngine Speech API key into the prompt. The extension saves it for future sessions and keeps it out of your project files.
 
-The key URL is also shown inside pi when the key is missing, when you run `/voice key`, and in `/voice help`:
+You can get/manage the key here:
 
-```text
 https://console.volcengine.com/speech/new/setting/apikeys?projectName=default
-```
+
+The key URL is also shown inside pi when the key is missing, when you run `/voice key`, and in `/voice help`:
 
 Then verify:
 
 ```text
 /voice config
 ```
-
-You can get/manage the key here:
-
-https://console.volcengine.com/speech/new/setting/apikeys?projectName=default
-
-If `VOLC_API_KEY` is missing, the extension does not silently fail. It shows an error notification explaining:
-
-- that the current provider API key is missing
-- to run `/voice key`
-- the VolcEngine API-key settings URL
-- that `/voice config` can be used to verify detection
-
-Manual fallback:
-
-```bash
-mkdir -p ~/.pi/agent
-cp .env.example ~/.pi/agent/voice-input.env
-$EDITOR ~/.pi/agent/voice-input.env
-```
-
-## Configuration reference
-
-Example:
-
-```bash
-# Required for the current provider. Usually set by /voice key.
-VOLC_API_KEY=your_volcengine_speech_api_key
-
-# Current provider: VolcEngine WebSocket ASR endpoint and resource
-VOLC_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream
-VOLC_STREAM_RESOURCE_ID=volc.seedasr.sauc.duration
-
-# Empty means auto-detect. Example: zh-CN.
-ASR_LANGUAGE=
-
-# Optional contextual prompt for ASR.
-ASR_PROMPT=
-
-# Faster for post-recording batch transcription. Use 200 for realtime-like packet size.
-STREAM_SEGMENT_MS=5000
-ASR_REQUEST_TIMEOUT_MS=90000
-
-# Empty means use PipeWire's default source.
-RECORDER_TARGET=
-RECORDING_FINALIZE_DELAY=0.1
-
-# Storage for recordings, logs, and state.
-VOICE_INPUT_HOME=~/.pi/agent/voice-input
-RECORDINGS_DIR=recordings
-RECORDER_STATE=recording.json
-RECORDER_LOG_DIR=logs
-
-# Shortcut. Default: ctrl+shift+r
-VOICE_INPUT_SHORTCUT=ctrl+shift+r
-```
-
-Config loading order, later values override earlier ones:
-
-1. `~/.pi/agent/voice-input.env`
-2. package-local `.env`
-3. current-working-directory `.env`
-4. shell environment variables
-
-Do not commit real credentials. Prefer `/voice key`, or keep private local values in `.env` or `~/.pi/agent/voice-input.env`.
 
 ## Usage
 
@@ -209,7 +133,7 @@ After changing the extension while pi is open, run:
 /reload
 ```
 
-## Volcengine links
+## Links
 
 - API key settings: https://console.volcengine.com/speech/new/setting/apikeys?projectName=default
 - ASR product page: https://www.volcengine.com/product/asr
