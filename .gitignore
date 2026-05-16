@@ -1,14 +1,8 @@
 node_modules/
-.venv/
 .env
 .env.*
 !.env.example
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.DS_Store
-.recording.json
+logs/
 recordings/
-
-# Package lock is intentionally not committed for this extension package.
+.DS_Store
 package-lock.json

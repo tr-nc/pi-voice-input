@@ -420,11 +420,20 @@ function parseRecordedWav(filePath: string): { pcm: Buffer; durationMs: number }
   return { pcm: data, durationMs: Math.round((data.length / (16000 * 2)) * 1000) };
 }
 
+function missingCredentialsMessage(): string {
+  return [
+    "Missing VOLC_API_KEY for Volcengine ASR.",
+    "Create ~/.pi/agent/voice-input.env with:",
+    "  VOLC_API_KEY=your_volcengine_speech_api_key",
+    "Optional: copy .env.example from this package as a template.",
+    "API key settings: https://console.volcengine.com/speech/new/setting/apikeys?projectName=default",
+    "Run /voice config to verify whether the key is detected.",
+  ].join("\n");
+}
+
 async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfig): Promise<TranscriptionResult> {
   if (!config.apiKey) {
-    throw new Error(
-      "Missing VOLC_API_KEY. Put it in ~/.pi/agent/voice-input.env, this package's .env, or your shell environment.",
-    );
+    throw new Error(missingCredentialsMessage());
   }
 
   const connectId = randomUUID();

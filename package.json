@@ -14,8 +14,7 @@
   "files": [
     "extensions",
     ".env.example",
-    "README.md",
-    "BENCHMARKS.md"
+    "README.md"
   ],
   "pi": {
     "extensions": [
@@ -26,6 +25,8 @@
     "ws": "^8.20.1"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "@types/node": "^25.8.0",
     "@types/ws": "^8.18.1",
     "typescript": "^6.0.3"
