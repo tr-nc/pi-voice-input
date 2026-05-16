@@ -1,0 +1,752 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key } from "@earendil-works/pi-tui";
+import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { gzipSync, gunzipSync } from "node:zlib";
+import WebSocket from "ws";
+
+const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = path.resolve(EXTENSION_DIR, "..");
+const DEFAULT_SHORTCUT = Key.ctrlShift("r");
+
+const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
+const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
+const MSG_TYPE_SERVER_FULL_RESPONSE = 0b1001;
+const MSG_TYPE_SERVER_ERROR_RESPONSE = 0b1111;
+const FLAG_POS_SEQUENCE = 0b0001;
+const FLAG_NEG_WITH_SEQUENCE = 0b0011;
+const SERIALIZATION_NONE = 0b0000;
+const SERIALIZATION_JSON = 0b0001;
+const COMPRESSION_GZIP = 0b0001;
+
+type EnvMap = Record<string, string>;
+
+type VoiceConfig = {
+  apiKey: string;
+  wsUrl: string;
+  resourceId: string;
+  language: string;
+  uid: string;
+  prompt: string;
+  segmentMs: number;
+  requestTimeoutMs: number;
+  finalizeDelayMs: number;
+  recorderTarget: string;
+  recordingsDir: string;
+  statePath: string;
+  logDir: string;
+  shortcut: string;
+  enableItn: boolean;
+  enablePunc: boolean;
+  enableDdc: boolean;
+  showUtterances: boolean;
+};
+
+type RecordingState = {
+  pid: number;
+  path: string;
+  logPath: string;
+  startedAt: string;
+  recorderTarget?: string;
+};
+
+type DecodedFrame = {
+  messageType: number;
+  sequence: number | null;
+  isLast: boolean;
+  payload: unknown;
+};
+
+type TranscriptionResult = {
+  text: string;
+  durationMs: number;
+  packets: number;
+  timings: {
+    wsOpenMs: number;
+    sendMs: number;
+    waitMs: number;
+    totalMs: number;
+  };
+};
+
+function parseEnvText(text: string): EnvMap {
+  const env: EnvMap = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const key = match[1];
+    let value = match[2] ?? "";
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
+function loadEnvFiles(): EnvMap {
+  const candidates = [
+    path.join(homedir(), ".pi", "agent", "voice-input.env"),
+    path.join(PACKAGE_ROOT, ".env"),
+    path.join(process.cwd(), ".env"),
+  ];
+  const merged: EnvMap = {};
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    Object.assign(merged, parseEnvText(readFileSync(file, "utf8")));
+  }
+  return merged;
+}
+
+function setting(env: EnvMap, name: string, fallback = ""): string {
+  const value = process.env[name] ?? env[name];
+  return value == null ? fallback : value;
+}
+
+function settingAny(env: EnvMap, names: string[], fallback = ""): string {
+  for (const name of names) {
+    const value = process.env[name] ?? env[name];
+    if (value != null && value !== "") return value;
+  }
+  return fallback;
+}
+
+function boolSetting(env: EnvMap, name: string, fallback: boolean): boolean {
+  const raw = setting(env, name, fallback ? "true" : "false").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return fallback;
+}
+
+function numberSetting(env: EnvMap, name: string, fallback: number): number {
+  const raw = setting(env, name, String(fallback)).trim();
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function expandHome(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/")) return path.join(homedir(), value.slice(2));
+  return value;
+}
+
+function resolvePath(value: string, baseDir: string): string {
+  const expanded = expandHome(value);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(baseDir, expanded);
+}
+
+function getConfig(): VoiceConfig {
+  const env = loadEnvFiles();
+  const defaultHome = path.join(homedir(), ".pi", "agent", "voice-input");
+  const voiceHome = resolvePath(setting(env, "VOICE_INPUT_HOME", defaultHome), process.cwd());
+
+  return {
+    apiKey: settingAny(env, ["VOLC_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_ASR_API_KEY"]).trim(),
+    wsUrl: setting(env, "VOLC_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream").trim(),
+    resourceId: setting(env, "VOLC_STREAM_RESOURCE_ID", "volc.seedasr.sauc.duration").trim(),
+    language: settingAny(env, ["ASR_LANGUAGE", "VOLC_ASR_LANGUAGE"], "").trim(),
+    uid: setting(env, "ASR_UID", "pi-voice-input").trim(),
+    prompt: setting(env, "ASR_PROMPT", "").trim(),
+    segmentMs: clamp(Math.round(numberSetting(env, "STREAM_SEGMENT_MS", 5000)), 100, 20000),
+    requestTimeoutMs: clamp(Math.round(numberSetting(env, "ASR_REQUEST_TIMEOUT_MS", 90000)), 1000, 10 * 60 * 1000),
+    finalizeDelayMs: clamp(numberSetting(env, "RECORDING_FINALIZE_DELAY", 0.1) * 1000, 0, 5000),
+    recorderTarget: setting(env, "RECORDER_TARGET", "").trim(),
+    recordingsDir: resolvePath(setting(env, "RECORDINGS_DIR", "recordings"), voiceHome),
+    statePath: resolvePath(setting(env, "RECORDER_STATE", "recording.json"), voiceHome),
+    logDir: resolvePath(setting(env, "RECORDER_LOG_DIR", "logs"), voiceHome),
+    shortcut: setting(env, "VOICE_INPUT_SHORTCUT", DEFAULT_SHORTCUT).trim() || DEFAULT_SHORTCUT,
+    enableItn: boolSetting(env, "ENABLE_ITN", true),
+    enablePunc: boolSetting(env, "ENABLE_PUNC", true),
+    enableDdc: boolSetting(env, "ENABLE_DDC", false),
+    showUtterances: boolSetting(env, "SHOW_UTTERANCES", false),
+  };
+}
+
+function ensureDir(dir: string) {
+  mkdirSync(dir, { recursive: true });
+}
+
+function timestampForFilename(): string {
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "");
+}
+
+function commandExists(command: string): boolean {
+  return spawnSync("sh", ["-lc", `command -v ${command}`], { stdio: "ignore" }).status === 0;
+}
+
+function recorderCommand(config: VoiceConfig, outputPath: string): string[] {
+  if (commandExists("pw-record")) {
+    const cmd = ["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16"];
+    if (config.recorderTarget) cmd.push("--target", config.recorderTarget);
+    cmd.push(outputPath);
+    return cmd;
+  }
+  if (commandExists("arecord")) {
+    return ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", outputPath];
+  }
+  throw new Error("No recorder found. Install PipeWire tools (pw-record) or alsa-utils (arecord).");
+}
+
+function readState(config: VoiceConfig): RecordingState | null {
+  if (!existsSync(config.statePath)) return null;
+  return JSON.parse(readFileSync(config.statePath, "utf8")) as RecordingState;
+}
+
+function writeState(config: VoiceConfig, state: RecordingState) {
+  ensureDir(path.dirname(config.statePath));
+  writeFileSync(config.statePath, JSON.stringify(state, null, 2));
+}
+
+function clearState(config: VoiceConfig) {
+  try {
+    unlinkSync(config.statePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function stopProcessGroup(pid: number, waitMs = 1500) {
+  const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGKILL"];
+  for (const signal of signals) {
+    if (!pidAlive(pid)) return;
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // ignore
+      }
+    }
+
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      if (!pidAlive(pid)) return;
+      await sleep(50);
+    }
+  }
+}
+
+function bufferFromWsData(data: WebSocket.RawData): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (Array.isArray(data)) return Buffer.concat(data);
+  return Buffer.from(data as ArrayBufferLike);
+}
+
+function wsHeader(messageType: number, flags: number, serialization: number, compression: number): Buffer {
+  return Buffer.from([
+    (0b0001 << 4) | 0b0001,
+    (messageType << 4) | flags,
+    (serialization << 4) | compression,
+    0,
+  ]);
+}
+
+function wsFullClientRequest(sequence: number, payload: unknown): Buffer {
+  const body = gzipSync(Buffer.from(JSON.stringify(payload), "utf8"));
+  const meta = Buffer.alloc(8);
+  meta.writeInt32BE(sequence, 0);
+  meta.writeUInt32BE(body.length, 4);
+  return Buffer.concat([
+    wsHeader(MSG_TYPE_CLIENT_FULL_REQUEST, FLAG_POS_SEQUENCE, SERIALIZATION_JSON, COMPRESSION_GZIP),
+    meta,
+    body,
+  ]);
+}
+
+function wsAudioRequest(sequence: number, audio: Buffer, isLast: boolean): Buffer {
+  const body = gzipSync(audio);
+  const meta = Buffer.alloc(8);
+  meta.writeInt32BE(isLast ? -sequence : sequence, 0);
+  meta.writeUInt32BE(body.length, 4);
+  return Buffer.concat([
+    wsHeader(
+      MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST,
+      isLast ? FLAG_NEG_WITH_SEQUENCE : FLAG_POS_SEQUENCE,
+      SERIALIZATION_NONE,
+      COMPRESSION_GZIP,
+    ),
+    meta,
+    body,
+  ]);
+}
+
+function wsDecodePayload(serialization: number, compression: number, payload: Buffer): unknown {
+  const decoded = compression === COMPRESSION_GZIP && payload.length > 0 ? gunzipSync(payload) : payload;
+  if (serialization === SERIALIZATION_JSON && decoded.length > 0) {
+    return JSON.parse(decoded.toString("utf8"));
+  }
+  return decoded;
+}
+
+function parseServerFrame(data: WebSocket.RawData): DecodedFrame {
+  const msg = bufferFromWsData(data);
+  if (msg.length < 4) throw new Error("Invalid ASR frame: header too short");
+
+  const headerSize = msg[0] & 0x0f;
+  const messageType = msg[1] >> 4;
+  const flags = msg[1] & 0x0f;
+  const serialization = msg[2] >> 4;
+  const compression = msg[2] & 0x0f;
+  let offset = headerSize * 4;
+
+  let sequence: number | null = null;
+  const isLast = Boolean(flags & 0b0010);
+  if (flags & 0b0001) {
+    sequence = msg.readInt32BE(offset);
+    offset += 4;
+  }
+
+  if (messageType === MSG_TYPE_SERVER_FULL_RESPONSE) {
+    const payloadSize = msg.readUInt32BE(offset);
+    offset += 4;
+    const payload = msg.subarray(offset, offset + payloadSize);
+    return {
+      messageType,
+      sequence,
+      isLast,
+      payload: wsDecodePayload(serialization, compression, payload),
+    };
+  }
+
+  if (messageType === MSG_TYPE_SERVER_ERROR_RESPONSE) {
+    const errorCode = msg.readInt32BE(offset);
+    offset += 4;
+    const payloadSize = msg.readUInt32BE(offset);
+    offset += 4;
+    const payload = msg.subarray(offset, offset + payloadSize);
+    let detail: unknown;
+    try {
+      detail = wsDecodePayload(serialization, compression, payload);
+    } catch {
+      detail = payload.toString("utf8");
+    }
+    throw new Error(`Volcengine ASR protocol error ${errorCode}: ${JSON.stringify(detail)}`);
+  }
+
+  return { messageType, sequence, isLast, payload: null };
+}
+
+function extractText(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const root = payload as { result?: { text?: unknown; utterances?: Array<{ text?: unknown }> } };
+  if (typeof root.result?.text === "string" && root.result.text) return root.result.text;
+  if (Array.isArray(root.result?.utterances)) {
+    return root.result.utterances.map((u) => (typeof u.text === "string" ? u.text : "")).join("").trim();
+  }
+  return "";
+}
+
+function sendWs(ws: WebSocket, frame: Buffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    ws.send(frame, { binary: true }, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+function parseRecordedWav(filePath: string): { pcm: Buffer; durationMs: number } {
+  const wav = readFileSync(filePath);
+  if (wav.length < 44 || wav.toString("ascii", 0, 4) !== "RIFF" || wav.toString("ascii", 8, 12) !== "WAVE") {
+    throw new Error(`Recording is not a WAV file: ${filePath}`);
+  }
+
+  let offset = 12;
+  let fmt: { format: number; channels: number; rate: number; bits: number } | null = null;
+  let data: Buffer | null = null;
+
+  while (offset + 8 <= wav.length) {
+    const id = wav.toString("ascii", offset, offset + 4);
+    const size = wav.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    const end = Math.min(start + size, wav.length);
+
+    if (id === "fmt ") {
+      fmt = {
+        format: wav.readUInt16LE(start),
+        channels: wav.readUInt16LE(start + 2),
+        rate: wav.readUInt32LE(start + 4),
+        bits: wav.readUInt16LE(start + 14),
+      };
+    } else if (id === "data") {
+      data = wav.subarray(start, end);
+    }
+
+    offset = start + size + (size % 2);
+  }
+
+  if (!fmt || !data) throw new Error(`Incomplete WAV recording: ${filePath}`);
+  const isPcm = fmt.format === 1 || fmt.format === 0xfffe;
+  if (!isPcm || fmt.channels !== 1 || fmt.rate !== 16000 || fmt.bits !== 16) {
+    throw new Error(
+      `Expected 16kHz mono 16-bit PCM WAV, got format=${fmt.format} channels=${fmt.channels} rate=${fmt.rate} bits=${fmt.bits}`,
+    );
+  }
+
+  return { pcm: data, durationMs: Math.round((data.length / (16000 * 2)) * 1000) };
+}
+
+async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfig): Promise<TranscriptionResult> {
+  if (!config.apiKey) {
+    throw new Error(
+      "Missing VOLC_API_KEY. Put it in ~/.pi/agent/voice-input.env, this package's .env, or your shell environment.",
+    );
+  }
+
+  const connectId = randomUUID();
+  const startedAt = Date.now();
+  const ws = new WebSocket(config.wsUrl, {
+    headers: {
+      "X-Api-Key": config.apiKey,
+      "X-Api-Resource-Id": config.resourceId,
+      "X-Api-Connect-Id": connectId,
+      "X-Api-Request-Id": connectId,
+    },
+    handshakeTimeout: 15_000,
+  });
+
+  const openStart = Date.now();
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.once("error", reject);
+  });
+  const wsOpenMs = Date.now() - openStart;
+
+  let finalText = "";
+  let seenLast = false;
+  let waitStart = 0;
+
+  const completion = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`ASR timeout after ${config.requestTimeoutMs}ms`));
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+    }, config.requestTimeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off("message", onMessage);
+      ws.off("error", onError);
+      ws.off("close", onClose);
+    };
+
+    const resolveOnce = () => {
+      cleanup();
+      resolve();
+    };
+
+    const rejectOnce = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    const onMessage = (data: WebSocket.RawData) => {
+      try {
+        const frame = parseServerFrame(data);
+        const text = extractText(frame.payload);
+        if (text) finalText = text;
+        if (frame.isLast) {
+          seenLast = true;
+          resolveOnce();
+        }
+      } catch (error) {
+        rejectOnce(error as Error);
+      }
+    };
+
+    const onError = (error: Error) => rejectOnce(error);
+    const onClose = (code: number, reason: Buffer) => {
+      if (!seenLast) rejectOnce(new Error(`ASR WebSocket closed before final response: ${code} ${reason.toString()}`));
+    };
+
+    ws.on("message", onMessage);
+    ws.on("error", onError);
+    ws.on("close", onClose);
+  });
+
+  const audioPayload: Record<string, unknown> = {
+    format: "pcm",
+    codec: "raw",
+    rate: 16000,
+    bits: 16,
+    channel: 1,
+  };
+  if (config.language && config.wsUrl.includes("bigmodel_nostream")) {
+    audioPayload.language = config.language;
+  }
+
+  const requestPayload: Record<string, unknown> = {
+    user: { uid: config.uid || "pi-voice-input" },
+    audio: audioPayload,
+    request: {
+      model_name: "bigmodel",
+      enable_itn: config.enableItn,
+      enable_punc: config.enablePunc,
+      enable_ddc: config.enableDdc,
+      show_utterances: config.showUtterances,
+      result_type: "full",
+      ...(config.prompt ? { corpus: { context: config.prompt } } : {}),
+    },
+  };
+
+  const sendStart = Date.now();
+  let sequence = 1;
+  let packets = 0;
+  await sendWs(ws, wsFullClientRequest(sequence, requestPayload));
+  sequence += 1;
+
+  const segmentSize = Math.max(1, Math.floor((16000 * 2 * config.segmentMs) / 1000));
+  if (pcm.length === 0) {
+    await sendWs(ws, wsAudioRequest(sequence, Buffer.alloc(0), true));
+    packets = 1;
+  } else {
+    for (let offset = 0; offset < pcm.length; offset += segmentSize) {
+      const isLast = offset + segmentSize >= pcm.length;
+      await sendWs(ws, wsAudioRequest(sequence, pcm.subarray(offset, offset + segmentSize), isLast));
+      packets += 1;
+      if (!isLast) sequence += 1;
+    }
+  }
+  const sendMs = Date.now() - sendStart;
+
+  waitStart = Date.now();
+  await completion;
+  const waitMs = Date.now() - waitStart;
+
+  try {
+    ws.close();
+  } catch {
+    // ignore
+  }
+
+  return {
+    text: finalText,
+    durationMs,
+    packets,
+    timings: {
+      wsOpenMs,
+      sendMs,
+      waitMs,
+      totalMs: Date.now() - startedAt,
+    },
+  };
+}
+
+function appendToEditor(ctx: ExtensionContext, text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  const current = ctx.ui.getEditorText();
+  const separator = current.trim().length > 0 && !current.endsWith("\n") ? "\n" : "";
+  ctx.ui.setEditorText(`${current}${separator}${trimmed}`);
+}
+
+async function isRecording(config: VoiceConfig): Promise<boolean> {
+  const state = readState(config);
+  return Boolean(state && pidAlive(state.pid));
+}
+
+async function startRecording(ctx: ExtensionContext) {
+  const config = getConfig();
+  const existing = readState(config);
+  if (existing && pidAlive(existing.pid)) {
+    ctx.ui.notify(`Already recording: pid=${existing.pid}`, "warning");
+    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", "● recording"));
+    return;
+  }
+  if (existing) clearState(config);
+
+  ensureDir(config.recordingsDir);
+  ensureDir(config.logDir);
+  const outputPath = path.join(config.recordingsDir, `recording-${timestampForFilename()}.wav`);
+  const logPath = path.join(config.logDir, `recording-${timestampForFilename()}.log`);
+  const cmd = recorderCommand(config, outputPath);
+
+  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● starting mic"));
+  const logFd = openSync(logPath, "a");
+  const child = spawn(cmd[0], cmd.slice(1), {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+  closeSync(logFd);
+
+  if (!child.pid) throw new Error("Recorder failed to start: no pid returned");
+  writeState(config, {
+    pid: child.pid,
+    path: outputPath,
+    logPath,
+    startedAt: new Date().toISOString(),
+    recorderTarget: config.recorderTarget || undefined,
+  });
+
+  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", "● recording"));
+  ctx.ui.notify("Voice recording started. Press Ctrl+Shift+R again to stop/transcribe.", "info");
+}
+
+async function stopRecording(ctx: ExtensionContext, transcribe = true) {
+  const config = getConfig();
+  const state = readState(config);
+  if (!state) {
+    ctx.ui.setStatus("voice-input", undefined);
+    ctx.ui.notify("Not recording.", "warning");
+    return;
+  }
+
+  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", transcribe ? "● transcribing" : "● stopping"));
+  if (pidAlive(state.pid)) await stopProcessGroup(state.pid);
+  clearState(config);
+  if (config.finalizeDelayMs > 0) await sleep(config.finalizeDelayMs);
+
+  if (!existsSync(state.path) || statSync(state.path).size === 0) {
+    const log = existsSync(state.logPath) ? readFileSync(state.logPath, "utf8") : "";
+    throw new Error(`Recording file missing/empty: ${state.path}\nRecorder log:\n${log}`);
+  }
+
+  if (!transcribe) {
+    ctx.ui.setStatus("voice-input", undefined);
+    ctx.ui.notify(`Voice recording stopped: ${state.path}`, "info");
+    return;
+  }
+
+  const decodeStart = Date.now();
+  const { pcm, durationMs } = parseRecordedWav(state.path);
+  const decodeMs = Date.now() - decodeStart;
+  const result = await transcribePcm(pcm, durationMs, config);
+  ctx.ui.setStatus("voice-input", undefined);
+
+  if (!result.text.trim()) {
+    ctx.ui.notify(
+      `Transcription finished but no text was returned. audio=${(durationMs / 1000).toFixed(2)}s total=${result.timings.totalMs}ms`,
+      "warning",
+    );
+    return;
+  }
+
+  appendToEditor(ctx, result.text);
+  ctx.ui.notify(
+    `Voice text inserted. audio=${(durationMs / 1000).toFixed(2)}s decode=${decodeMs}ms asr=${result.timings.totalMs}ms packets=${result.packets}`,
+    "info",
+  );
+}
+
+async function toggleRecording(ctx: ExtensionContext) {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("voice input requires interactive pi UI", "error");
+    return;
+  }
+  const config = getConfig();
+  if (await isRecording(config)) await stopRecording(ctx, true);
+  else await startRecording(ctx);
+}
+
+function configSummary(config: VoiceConfig): string {
+  return [
+    "Voice input config:",
+    `- api key: ${config.apiKey ? "set" : "missing"}`,
+    `- ws url: ${config.wsUrl}`,
+    `- resource id: ${config.resourceId}`,
+    `- language: ${config.language || "auto"}`,
+    `- recorder target: ${config.recorderTarget || "PipeWire/default"}`,
+    `- segment: ${config.segmentMs}ms`,
+    `- recordings: ${config.recordingsDir}`,
+    `- state: ${config.statePath}`,
+    `- shortcut: ${config.shortcut}`,
+    "Config files checked: ~/.pi/agent/voice-input.env, package .env, current .env; shell env overrides them.",
+  ].join("\n");
+}
+
+export default function (pi: ExtensionAPI) {
+  const startupConfig = getConfig();
+
+  pi.registerShortcut(startupConfig.shortcut as ReturnType<typeof Key.ctrlShift>, {
+    description: "Toggle voice recording and insert transcription into editor",
+    handler: async (ctx) => {
+      try {
+        await toggleRecording(ctx);
+      } catch (error) {
+        ctx.ui.setStatus("voice-input", undefined);
+        ctx.ui.notify(`Voice input error: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("voice", {
+    description: "Voice input: start | stop | status | toggle | cancel | config",
+    handler: async (args, ctx) => {
+      const action = (args || "toggle").trim().toLowerCase();
+      try {
+        if (action === "start") {
+          await startRecording(ctx);
+          return;
+        }
+        if (action === "stop") {
+          await stopRecording(ctx, true);
+          return;
+        }
+        if (action === "cancel") {
+          await stopRecording(ctx, false);
+          return;
+        }
+        if (action === "status") {
+          const config = getConfig();
+          const state = readState(config);
+          ctx.ui.notify(JSON.stringify({ recording: Boolean(state && pidAlive(state.pid)), state }, null, 2), "info");
+          return;
+        }
+        if (action === "config") {
+          ctx.ui.notify(configSummary(getConfig()), "info");
+          return;
+        }
+        if (action === "toggle" || action === "") {
+          await toggleRecording(ctx);
+          return;
+        }
+        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config", "error");
+      } catch (error) {
+        ctx.ui.setStatus("voice-input", undefined);
+        ctx.ui.notify(`Voice command error: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.notify(`Voice input loaded: ${startupConfig.shortcut} toggles recording.`, "info");
+  });
+}
