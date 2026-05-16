@@ -35,22 +35,19 @@ System dependency, one of:
 
 ## Install
 
-From a local checkout:
+Install the published package with pi:
 
 ```bash
-git clone <this-repo-url>
-cd pi-voice-input-volc-asr
-pi install .
+pi install npm:pi-voice-input-volc-asr
 ```
 
-For development without installing:
+To pin a specific version:
 
 ```bash
-npm install
-pi -e ./extensions/voice-input.ts
+pi install npm:pi-voice-input-volc-asr@0.1.0
 ```
 
-After changing the extension while pi is open, run:
+If pi is already running, reload extensions after installation:
 
 ```text
 /reload
@@ -153,6 +150,34 @@ Slash commands:
 - The extension uses post-recording WebSocket ASR: it records locally first, then sends the stopped recording in chunks. It is optimized for fast voice input, not live subtitles.
 - The default `STREAM_SEGMENT_MS=5000` is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
+
+## Development
+
+Clone the repo and install dependencies:
+
+```bash
+git clone <this-repo-url>
+cd pi-voice-input-volc-asr
+npm install
+```
+
+Run directly without installing the package:
+
+```bash
+pi -e ./extensions/voice-input.ts
+```
+
+Or install the local checkout while developing:
+
+```bash
+pi install .
+```
+
+After changing the extension while pi is open, run:
+
+```text
+/reload
+```
 
 ## Volcengine links
 
