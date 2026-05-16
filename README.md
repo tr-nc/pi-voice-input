@@ -171,7 +171,7 @@ Slash commands:
 Clone the repo and install dependencies:
 
 ```bash
-git clone <this-repo-url>
+git clone git@github.com:tr-nc/pi-voice-input.git
 cd pi-voice-input
 npm install
 ```

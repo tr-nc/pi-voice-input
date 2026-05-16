@@ -12,6 +12,14 @@
     "asr"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/tr-nc/pi-voice-input.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tr-nc/pi-voice-input/issues"
+  },
+  "homepage": "https://github.com/tr-nc/pi-voice-input#readme",
   "files": [
     "extensions",
     ".env.example",
