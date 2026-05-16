@@ -78,6 +78,12 @@ In pi, run:
 
 Paste your VolcEngine Speech API key into the prompt. The extension saves it for future sessions and keeps it out of your project files.
 
+The key URL is also shown inside pi when the key is missing, when you run `/voice key`, and in `/voice help`:
+
+```text
+https://console.volcengine.com/speech/new/setting/apikeys?projectName=default
+```
+
 Then verify:
 
 ```text
@@ -166,6 +172,7 @@ Slash commands:
 /voice status   # show recorder state
 /voice config   # show effective non-secret config and whether API key is detected
 /voice key      # prompt for and save the current provider API key
+/voice help     # show setup help, including the explicit VolcEngine API key URL
 ```
 
 ## Notes

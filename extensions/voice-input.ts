@@ -22,6 +22,7 @@ import WebSocket from "ws";
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(EXTENSION_DIR, "..");
 const PRIVATE_CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.env");
+const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
@@ -458,7 +459,7 @@ function missingCredentialsMessage(): string {
   return [
     "Missing VOLC_API_KEY for the current VolcEngine ASR provider.",
     "Run /voice key and paste your VolcEngine Speech API key.",
-    "API key settings: https://console.volcengine.com/speech/new/setting/apikeys?projectName=default",
+    `Get/create the key here: ${VOLC_API_KEY_URL}`,
     "Run /voice config to verify whether the key is detected.",
   ].join("\n");
 }
@@ -717,14 +718,26 @@ async function toggleRecording(ctx: ExtensionContext) {
   else await startRecording(ctx);
 }
 
+function setupHelp(config = getConfig()): string {
+  return [
+    "pi Voice Input setup:",
+    "- Current provider: VolcEngine WebSocket ASR",
+    `- API key: ${config.apiKey ? "set" : "missing"}`,
+    "- To save/update the key, run: /voice key",
+    `- Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
+    "- After saving the key, run: /voice config",
+  ].join("\n");
+}
+
 async function configureApiKey(ctx: ExtensionContext, providedKey = "") {
   let apiKey = providedKey.trim();
 
   if (!apiKey) {
     if (!ctx.hasUI) {
-      ctx.ui.notify("Run /voice key in interactive pi, or set VOLC_API_KEY in the environment.", "error");
+      ctx.ui.notify(`Run /voice key in interactive pi, or get a key from ${VOLC_API_KEY_URL} and set VOLC_API_KEY.`, "error");
       return;
     }
+    ctx.ui.notify(`Get/create a VolcEngine Speech API key here:\n${VOLC_API_KEY_URL}`, "info");
     const current = getConfig().apiKey;
     const placeholder = current ? "Paste a new VolcEngine API key (current key is already set)" : "Paste VOLC_API_KEY";
     apiKey = (await ctx.ui.input("VolcEngine API key", placeholder))?.trim() ?? "";
@@ -752,6 +765,7 @@ function configSummary(config: VoiceConfig): string {
     `- state: ${config.statePath}`,
     `- shortcut: ${config.shortcut}`,
     "Run /voice key to save/update the current provider API key.",
+    `VolcEngine API key URL: ${VOLC_API_KEY_URL}`,
     "Config files checked: ~/.pi/agent/voice-input.env, package .env, current .env; shell env overrides them.",
   ].join("\n");
 }
@@ -772,7 +786,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("voice", {
-    description: "Voice input: start | stop | status | toggle | cancel | config | key",
+    description: "Voice input: start | stop | status | toggle | cancel | config | key | help",
     handler: async (args, ctx) => {
       const input = (args || "toggle").trim();
       const action = (input.split(/\s+/, 1)[0] || "toggle").toLowerCase();
@@ -804,11 +818,15 @@ export default function (pi: ExtensionAPI) {
           await configureApiKey(ctx, rest);
           return;
         }
+        if (["help", "doctor"].includes(action)) {
+          ctx.ui.notify(setupHelp(getConfig()), "info");
+          return;
+        }
         if (action === "toggle" || action === "") {
           await toggleRecording(ctx);
           return;
         }
-        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config | key", "error");
+        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config | key | help", "error");
       } catch (error) {
         ctx.ui.setStatus("voice-input", undefined);
         ctx.ui.notify(`Voice command error: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -817,6 +835,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    ctx.ui.notify(`Voice input loaded: ${startupConfig.shortcut} toggles recording.`, "info");
+    if (getConfig().apiKey) {
+      ctx.ui.notify(`Voice input loaded: ${startupConfig.shortcut} toggles recording.`, "info");
+      return;
+    }
+    ctx.ui.notify(
+      [
+        `Voice input loaded: ${startupConfig.shortcut} toggles recording.`,
+        "API key is missing. Run /voice key to set it up.",
+        `Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
+      ].join("\n"),
+      "warning",
+    );
   });
 }
