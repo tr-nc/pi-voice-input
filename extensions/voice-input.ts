@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { completeSimple, type Api, type Model } from "@earendil-works/pi-ai";
 import { Key } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -24,6 +25,17 @@ const PACKAGE_ROOT = path.resolve(EXTENSION_DIR, "..");
 const PRIVATE_CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.env");
 const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
+const DEFAULT_POSTPROCESS_MODEL = "deepseek/deepseek-v4-flash";
+const POSTPROCESS_SYSTEM_PROMPT = `你是 pi 语音输入插件的语音识别后处理器。你的唯一任务是把原始 ASR 文本改写为可直接提交给编码智能体的用户指令。
+
+规则：
+- 只输出优化后的用户指令正文，不要输出解释、标题、前后缀、引号、代码围栏或寒暄。
+- 结合上下文理解省略指代、当前任务、文件/项目名称和用户意图；上下文仅用于理解，不要重复上下文内容，除非原始语音明确要求引用或修改它。
+- 修正明显的语音识别错误、同音/近音错误、断句和标点错误；保留代码标识符、命令、路径、URL、模型名、包名和专有名词。
+- 如果用户口误后自我更正（例如“不是……是……”“不对……”“算了改成……”），只保留更正后的正确指令，删除错误说法和更正过程。
+- 让结果完整、符合逻辑、指令明确、有指导性；必要时拆成条目或步骤。
+- 不要凭空添加原始语音没有表达的新需求；不确定时保留原意并用更清晰的措辞表达。
+- 输出语言通常与原始语音一致。`;
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
 const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
@@ -56,6 +68,11 @@ type VoiceConfig = {
   enablePunc: boolean;
   enableDdc: boolean;
   showUtterances: boolean;
+  postprocessEnabled: boolean;
+  postprocessModel: string;
+  postprocessTimeoutMs: number;
+  postprocessMaxTokens: number;
+  postprocessContextChars: number;
 };
 
 type RecordingState = {
@@ -181,6 +198,15 @@ function getConfig(): VoiceConfig {
     enablePunc: boolSetting(env, "ENABLE_PUNC", true),
     enableDdc: boolSetting(env, "ENABLE_DDC", false),
     showUtterances: boolSetting(env, "SHOW_UTTERANCES", false),
+    postprocessEnabled: boolSetting(env, "VOICE_POSTPROCESS_ENABLED", true),
+    postprocessModel: setting(env, "VOICE_POSTPROCESS_MODEL", DEFAULT_POSTPROCESS_MODEL).trim() || DEFAULT_POSTPROCESS_MODEL,
+    postprocessTimeoutMs: clamp(
+      Math.round(numberSetting(env, "VOICE_POSTPROCESS_TIMEOUT_MS", 30000)),
+      1000,
+      10 * 60 * 1000,
+    ),
+    postprocessMaxTokens: clamp(Math.round(numberSetting(env, "VOICE_POSTPROCESS_MAX_TOKENS", 2048)), 128, 32768),
+    postprocessContextChars: clamp(Math.round(numberSetting(env, "VOICE_POSTPROCESS_CONTEXT_CHARS", 6000)), 0, 50000),
   };
 }
 
@@ -611,6 +637,196 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
   };
 }
 
+function tailText(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+  return `…${text.slice(-maxChars)}`;
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}…`;
+}
+
+function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const block = part as { type?: unknown; text?: unknown };
+      if (block.type === "text" && typeof block.text === "string") return block.text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function getEditorContext(ctx: ExtensionContext, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  try {
+    return tailText(ctx.ui.getEditorText().trim(), maxChars);
+  } catch {
+    return "";
+  }
+}
+
+function getRecentSessionContext(ctx: ExtensionContext, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  const lines: string[] = [];
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (entry.type !== "message") continue;
+    const message = entry.message as { role?: unknown; content?: unknown };
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const text = textFromContent(message.content).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    lines.push(`${message.role}: ${truncateText(text, 1200)}`);
+  }
+  return tailText(lines.slice(-8).join("\n"), maxChars);
+}
+
+function simplifyModelReference(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function stripThinkingSuffix(value: string): string {
+  return value.replace(/:(?:off|minimal|low|medium|high|xhigh)$/i, "");
+}
+
+function modelLabel(model: Model<Api>): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function resolvePostprocessModel(ctx: ExtensionContext, reference: string): Model<Api> {
+  const requested = stripThinkingSuffix(reference.trim());
+  if (!requested) throw new Error("VOICE_POSTPROCESS_MODEL is empty");
+
+  const models = ctx.modelRegistry.getAll();
+  const lower = requested.toLowerCase();
+  const simple = simplifyModelReference(requested);
+
+  const exactCanonical = models.filter((model) => modelLabel(model).toLowerCase() === lower);
+  if (exactCanonical.length === 1) return exactCanonical[0];
+
+  const exactBare = models.filter((model) => model.id.toLowerCase() === lower || model.name.toLowerCase() === lower);
+  if (exactBare.length === 1) return exactBare[0];
+  if (exactBare.length > 1) {
+    throw new Error(
+      `Ambiguous postprocess model "${reference}". Use provider/model, e.g. ${exactBare.map(modelLabel).slice(0, 5).join(", ")}`,
+    );
+  }
+
+  const exactSimple = models.filter(
+    (model) =>
+      simplifyModelReference(modelLabel(model)) === simple ||
+      simplifyModelReference(model.id) === simple ||
+      simplifyModelReference(model.name) === simple,
+  );
+  if (exactSimple.length === 1) return exactSimple[0];
+  if (exactSimple.length > 1) {
+    throw new Error(
+      `Ambiguous postprocess model "${reference}". Use provider/model, e.g. ${exactSimple.map(modelLabel).slice(0, 5).join(", ")}`,
+    );
+  }
+
+  const fuzzy = models.filter(
+    (model) =>
+      modelLabel(model).toLowerCase().includes(lower) ||
+      model.id.toLowerCase().includes(lower) ||
+      model.name.toLowerCase().includes(lower) ||
+      simplifyModelReference(modelLabel(model)).includes(simple) ||
+      simplifyModelReference(model.id).includes(simple) ||
+      simplifyModelReference(model.name).includes(simple),
+  );
+  if (fuzzy.length === 1) return fuzzy[0];
+  if (fuzzy.length > 1) {
+    throw new Error(
+      `Ambiguous postprocess model "${reference}". Use provider/model, e.g. ${fuzzy.map(modelLabel).slice(0, 5).join(", ")}`,
+    );
+  }
+
+  throw new Error(`Postprocess model "${reference}" not found. Run pi --list-models to see available models.`);
+}
+
+function extractAssistantText(message: { content: unknown }): string {
+  return textFromContent(message.content).trim();
+}
+
+function cleanPostprocessOutput(output: string): string {
+  let text = output.trim();
+  const fence = text.match(/^```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n```$/);
+  if (fence) text = fence[1].trim();
+  text = text.replace(/^(?:优化后的(?:用户)?指令|整理后的(?:用户)?指令|改写后的(?:用户)?指令)\s*[：:]\s*/u, "").trim();
+  return text;
+}
+
+function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: VoiceConfig): string {
+  const contextBudget = config.postprocessContextChars;
+  const editorContext = getEditorContext(ctx, Math.floor(contextBudget / 2));
+  const sessionContext = getRecentSessionContext(ctx, Math.ceil(contextBudget / 2));
+
+  return [
+    "请根据上下文优化下面的原始语音识别结果。",
+    "如果上下文为空，直接依据原始文本优化。",
+    "不要重复上下文本身；只输出原始语音对应的最终用户指令。",
+    "",
+    "--- 上下文：当前编辑器已有内容 ---",
+    editorContext || "（空）",
+    "",
+    "--- 上下文：最近会话 ---",
+    sessionContext || "（空）",
+    "",
+    "--- 原始语音识别结果 ---",
+    rawText.trim(),
+  ].join("\n");
+}
+
+async function postprocessTranscript(ctx: ExtensionContext, rawText: string, config: VoiceConfig): Promise<string> {
+  if (!config.postprocessEnabled) return rawText;
+
+  const raw = rawText.trim();
+  if (!raw) return rawText;
+
+  const model = resolvePostprocessModel(ctx, config.postprocessModel);
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) {
+    throw new Error(`Postprocess model ${modelLabel(model)} is not ready: ${auth.error}`);
+  }
+
+  const response = await completeSimple(
+    model,
+    {
+      systemPrompt: POSTPROCESS_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: buildPostprocessPrompt(ctx, raw, config),
+          timestamp: Date.now(),
+        },
+      ],
+      tools: [],
+    },
+    {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      temperature: 0,
+      maxTokens: config.postprocessMaxTokens,
+      timeoutMs: config.postprocessTimeoutMs,
+      maxRetries: 0,
+      cacheRetention: "none",
+      signal: ctx.signal,
+    },
+  );
+
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new Error(response.errorMessage || `Postprocess model stopped with ${response.stopReason}`);
+  }
+
+  const polished = cleanPostprocessOutput(extractAssistantText(response));
+  return polished || rawText;
+}
+
 function appendToEditor(ctx: ExtensionContext, text: string) {
   const trimmed = text.trim();
   if (!trimmed) return;
@@ -691,9 +907,9 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
   const { pcm, durationMs } = parseRecordedWav(state.path);
   const decodeMs = Date.now() - decodeStart;
   const result = await transcribePcm(pcm, durationMs, config);
-  ctx.ui.setStatus("voice-input", undefined);
 
   if (!result.text.trim()) {
+    ctx.ui.setStatus("voice-input", undefined);
     ctx.ui.notify(
       `Transcription finished but no text was returned. audio=${(durationMs / 1000).toFixed(2)}s total=${result.timings.totalMs}ms`,
       "warning",
@@ -701,9 +917,31 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
     return;
   }
 
-  appendToEditor(ctx, result.text);
+  let finalText = result.text;
+  let postprocessMs = 0;
+  let postprocessUsed = false;
+  if (config.postprocessEnabled) {
+    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● polishing"));
+    const postprocessStart = Date.now();
+    try {
+      finalText = await postprocessTranscript(ctx, result.text, config);
+      postprocessMs = Date.now() - postprocessStart;
+      postprocessUsed = finalText.trim() !== result.text.trim();
+    } catch (error) {
+      postprocessMs = Date.now() - postprocessStart;
+      ctx.ui.notify(
+        `Voice postprocess failed; inserting raw transcript. ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+  }
+
+  ctx.ui.setStatus("voice-input", undefined);
+  appendToEditor(ctx, finalText);
   ctx.ui.notify(
-    `Voice text inserted. audio=${(durationMs / 1000).toFixed(2)}s decode=${decodeMs}ms asr=${result.timings.totalMs}ms packets=${result.packets}`,
+    `Voice text inserted. audio=${(durationMs / 1000).toFixed(2)}s decode=${decodeMs}ms asr=${result.timings.totalMs}ms${
+      config.postprocessEnabled ? ` postprocess=${postprocessMs}ms${postprocessUsed ? " polished" : ""}` : ""
+    } packets=${result.packets}`,
     "info",
   );
 }
@@ -724,6 +962,7 @@ function setupHelp(config = getConfig()): string {
     "- Current provider: VolcEngine WebSocket ASR",
     `- API key: ${config.apiKey ? "set" : "missing"}`,
     "- To save/update the key, run: /voice key",
+    `- Postprocess: ${config.postprocessEnabled ? "enabled" : "disabled"} (${config.postprocessModel})`,
     `- Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
     "- After saving the key, run: /voice config",
   ].join("\n");
@@ -764,6 +1003,10 @@ function configSummary(config: VoiceConfig): string {
     `- recordings: ${config.recordingsDir}`,
     `- state: ${config.statePath}`,
     `- shortcut: ${config.shortcut}`,
+    `- postprocess: ${config.postprocessEnabled ? "enabled" : "disabled"}`,
+    `- postprocess model: ${config.postprocessModel}`,
+    "- postprocess thinking: off",
+    `- postprocess timeout: ${config.postprocessTimeoutMs}ms`,
     "Run /voice key to save/update the current provider API key.",
     `VolcEngine API key URL: ${VOLC_API_KEY_URL}`,
     "Config files checked: ~/.pi/agent/voice-input.env, package .env, current .env; shell env overrides them.",

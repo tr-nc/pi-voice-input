@@ -23,6 +23,8 @@ pi extension: extensions/voice-input.ts
   ├─ parses the WAV container in TypeScript and extracts raw PCM
   ├─ sends PCM frames to the configured ASR provider via ws
   │    └─ current provider: VolcEngine /api/v3/sauc/bigmodel_nostream
+  ├─ optionally post-processes raw ASR text with a configured pi model
+  │    └─ default: deepseek/deepseek-v4-flash, no reasoning option
   └─ appends the final transcript to pi's editor with ctx.ui.setEditorText()
 ```
 
@@ -78,6 +80,17 @@ Then verify:
 /voice config
 ```
 
+## Configure post-processing
+
+By default, recognized text is polished before insertion with pi's existing `deepseek/deepseek-v4-flash` model. Configure it in `~/.pi/agent/voice-input.env`:
+
+```env
+VOICE_POSTPROCESS_ENABLED=true
+VOICE_POSTPROCESS_MODEL=deepseek/deepseek-v4-flash
+```
+
+`VOICE_POSTPROCESS_MODEL` is resolved from pi's model registry, so any model shown by `pi --list-models` can be used. If post-processing fails, the raw ASR transcript is inserted instead.
+
 ## Usage
 
 Shortcut:
@@ -104,6 +117,7 @@ Slash commands:
 - The extension uses post-recording WebSocket ASR: it records locally first, then sends the stopped recording in chunks. It is optimized for fast voice input, not live subtitles.
 - The default `STREAM_SEGMENT_MS=5000` is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
+- Post-processing uses the current editor content and recent session messages as context, but outputs only the refined user instruction.
 
 ## Development
 
