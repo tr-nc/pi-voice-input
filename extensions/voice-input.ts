@@ -5,16 +5,17 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
+  mkdtempSync,
   readFileSync,
+  readdirSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, platform } from "node:os";
+import { homedir, platform, tmpdir } from "node:os";
 import path from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import WebSocket from "ws";
@@ -65,9 +66,7 @@ type VoiceConfig = {
   requestTimeoutMs: number;
   finalizeDelayMs: number;
   recorderTarget: string;
-  recordingsDir: string;
   statePath: string;
-  logDir: string;
   shortcut: string;
   enableItn: boolean;
   enablePunc: boolean;
@@ -83,7 +82,7 @@ type VoiceConfig = {
 type RecordingState = {
   pid: number;
   path: string;
-  logPath: string;
+  logPath?: string;
   startedAt: string;
   recorderTarget?: string;
   deviceName?: string;
@@ -169,9 +168,7 @@ function getConfig(): VoiceConfig {
     requestTimeoutMs: 90000,
     finalizeDelayMs: 100,
     recorderTarget: "",
-    recordingsDir: path.join(voiceHome, "recordings"),
     statePath: path.join(voiceHome, "recording.json"),
-    logDir: path.join(voiceHome, "logs"),
     shortcut: DEFAULT_SHORTCUT,
     enableItn: true,
     enablePunc: true,
@@ -345,6 +342,85 @@ function clearState(config: VoiceConfig) {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+}
+
+function createRecordingPath(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-voice-input-"));
+  chmodSync(dir, 0o700);
+  return path.join(dir, `recording-${timestampForFilename()}.wav`);
+}
+
+function deleteFileIfExists(filePath?: string): string | null {
+  if (!filePath) return null;
+  try {
+    unlinkSync(filePath);
+    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return `failed to delete ${filePath}: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+function deleteTemporaryRecordingDir(filePath: string): string | null {
+  const dir = path.dirname(filePath);
+  const parent = path.dirname(dir);
+  if (path.resolve(parent) !== path.resolve(tmpdir()) || !path.basename(dir).startsWith("pi-voice-input-")) {
+    return null;
+  }
+
+  try {
+    rmdirSync(dir);
+    return null;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    return `failed to remove temporary directory ${dir}: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+function cleanupRecordingArtifacts(state: Pick<RecordingState, "path" | "logPath">): string[] {
+  return [deleteFileIfExists(state.path), deleteFileIfExists(state.logPath), deleteTemporaryRecordingDir(state.path)].filter(
+    (message): message is string => Boolean(message),
+  );
+}
+
+function cleanupLegacyDirectory(dir: string, filePattern: RegExp, protectedPaths: Set<string>): string[] {
+  if (!existsSync(dir)) return [];
+  const warnings: string[] = [];
+
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || !filePattern.test(entry.name)) continue;
+    const filePath = path.join(dir, entry.name);
+    if (protectedPaths.has(path.resolve(filePath))) continue;
+    const warning = deleteFileIfExists(filePath);
+    if (warning) warnings.push(warning);
+  }
+
+  try {
+    rmdirSync(dir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTEMPTY") {
+      warnings.push(`failed to remove legacy directory ${dir}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return warnings;
+}
+
+function cleanupLegacyStoredArtifacts(config: VoiceConfig): string[] {
+  const state = readState(config);
+  const protectedPaths = new Set<string>();
+  if (state && pidAlive(state.pid)) {
+    protectedPaths.add(path.resolve(state.path));
+    if (state.logPath) protectedPaths.add(path.resolve(state.logPath));
+  }
+
+  const voiceHome = path.dirname(config.statePath);
+  return [
+    ...cleanupLegacyDirectory(path.join(voiceHome, "recordings"), /^recording-.*\.wav$/, protectedPaths),
+    ...cleanupLegacyDirectory(path.join(voiceHome, "logs"), /^recording-.*\.log$/, protectedPaths),
+  ];
 }
 
 function pidAlive(pid: number): boolean {
@@ -904,6 +980,14 @@ async function isRecording(config: VoiceConfig): Promise<boolean> {
   return Boolean(state && pidAlive(state.pid));
 }
 
+function cleanupStaleRecordingState(config: VoiceConfig): string[] {
+  const state = readState(config);
+  if (!state || pidAlive(state.pid)) return [];
+  const cleanupWarnings = cleanupRecordingArtifacts(state);
+  clearState(config);
+  return cleanupWarnings;
+}
+
 function requireInteractiveUi(ctx: ExtensionContext, action: string): boolean {
   if (ctx.hasUI) return true;
   ctx.ui.notify(`Voice ${action} requires interactive pi UI. Use /voice config or /voice help for setup information.`, "error");
@@ -920,29 +1004,42 @@ async function startRecording(ctx: ExtensionContext) {
     ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("accent", recordingStatusText(deviceName)));
     return;
   }
-  if (existing) clearState(config);
+  if (existing) {
+    const cleanupWarnings = cleanupRecordingArtifacts(existing);
+    clearState(config);
+    if (cleanupWarnings.length) ctx.ui.notify(`Voice input cleanup warning:\n${cleanupWarnings.join("\n")}`, "warning");
+  }
 
-  ensureDir(config.recordingsDir);
-  ensureDir(config.logDir);
-  const outputPath = path.join(config.recordingsDir, `recording-${timestampForFilename()}.wav`);
-  const logPath = path.join(config.logDir, `recording-${timestampForFilename()}.log`);
-  const cmd = recorderCommand(config, outputPath);
+  const outputPath = createRecordingPath();
+  let cmd: string[];
+  try {
+    cmd = recorderCommand(config, outputPath);
+  } catch (error) {
+    cleanupRecordingArtifacts({ path: outputPath });
+    throw error;
+  }
   const deviceName = recordingDeviceName(config, cmd[0]);
 
   ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● starting mic"));
-  const logFd = openSync(logPath, "a");
-  const child = spawn(cmd[0], cmd.slice(1), {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-  });
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(cmd[0], cmd.slice(1), {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+  } catch (error) {
+    cleanupRecordingArtifacts({ path: outputPath });
+    throw error;
+  }
   child.unref();
-  closeSync(logFd);
 
-  if (!child.pid) throw new Error("Recorder failed to start: no pid returned");
+  if (!child.pid) {
+    cleanupRecordingArtifacts({ path: outputPath });
+    throw new Error("Recorder failed to start: no pid returned");
+  }
   writeState(config, {
     pid: child.pid,
     path: outputPath,
-    logPath,
     startedAt: new Date().toISOString(),
     recorderTarget: config.recorderTarget || undefined,
     deviceName,
@@ -966,21 +1063,41 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
   clearState(config);
   if (config.finalizeDelayMs > 0) await sleep(config.finalizeDelayMs);
 
-  if (!existsSync(state.path) || statSync(state.path).size === 0) {
-    const log = existsSync(state.logPath) ? readFileSync(state.logPath, "utf8") : "";
-    throw new Error(`Recording file missing/empty: ${state.path}\nRecorder log:\n${log}`);
-  }
-
   if (!transcribe) {
+    const cleanupWarnings = cleanupRecordingArtifacts(state);
     ctx.ui.setStatus("voice-input", undefined);
-    ctx.ui.notify(`Voice recording stopped: ${state.path}`, "info");
+    ctx.ui.notify(
+      cleanupWarnings.length
+        ? `Voice recording cancelled; local audio discard attempted, but cleanup had warnings:\n${cleanupWarnings.join("\n")}`
+        : "Voice recording cancelled; local audio discarded.",
+      cleanupWarnings.length ? "warning" : "info",
+    );
     return;
   }
 
+  if (!existsSync(state.path) || statSync(state.path).size === 0) {
+    const cleanupWarnings = cleanupRecordingArtifacts(state);
+    throw new Error(
+      `Recording file missing/empty: ${state.path}. Recorder output is not persisted for privacy.${
+        cleanupWarnings.length ? `\nCleanup warnings:\n${cleanupWarnings.join("\n")}` : ""
+      }`,
+    );
+  }
+
+  let decodeMs = 0;
+  let durationMs = 0;
+  let result: TranscriptionResult | undefined;
   const decodeStart = Date.now();
-  const { pcm, durationMs } = parseRecordedWav(state.path);
-  const decodeMs = Date.now() - decodeStart;
-  const result = await transcribePcm(pcm, durationMs, config);
+  try {
+    const recording = parseRecordedWav(state.path);
+    durationMs = recording.durationMs;
+    decodeMs = Date.now() - decodeStart;
+    result = await transcribePcm(recording.pcm, recording.durationMs, config);
+  } finally {
+    const cleanupWarnings = cleanupRecordingArtifacts(state);
+    if (cleanupWarnings.length) ctx.ui.notify(`Voice input cleanup warning:\n${cleanupWarnings.join("\n")}`, "warning");
+  }
+  if (!result) throw new Error("Transcription failed before a result was produced");
 
   if (!result.text.trim()) {
     ctx.ui.setStatus("voice-input", undefined);
@@ -1148,7 +1265,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    if (getConfig().apiKey) {
+    const currentConfig = getConfig();
+    const cleanupWarnings = [
+      ...cleanupStaleRecordingState(currentConfig),
+      ...cleanupLegacyStoredArtifacts(currentConfig),
+    ];
+    if (cleanupWarnings.length) ctx.ui.notify(`Voice input cleanup warning:\n${cleanupWarnings.join("\n")}`, "warning");
+
+    if (currentConfig.apiKey) {
       ctx.ui.notify(`Voice input loaded: ${startupConfig.shortcut} toggles recording.`, "info");
       return;
     }
@@ -1156,7 +1280,7 @@ export default function (pi: ExtensionAPI) {
       [
         `Voice input loaded: ${startupConfig.shortcut} toggles recording.`,
         "API key is missing. Run /voice key to set it up, or edit the JSON config file.",
-        `Config file: ${startupConfig.configPath}`,
+        `Config file: ${currentConfig.configPath}`,
         `Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
       ].join("\n"),
       "warning",

@@ -27,7 +27,7 @@ pi extension: extensions/voice-input.ts
   │    ├─ Linux preferred: pw-record
   │    ├─ Linux fallback: arecord
   │    └─ macOS: afrecord
-  ├─ records 16 kHz mono 16-bit WAV
+  ├─ records a temporary 16 kHz mono 16-bit WAV
   ├─ parses the WAV container in TypeScript and extracts raw PCM
   ├─ sends PCM frames to the configured ASR provider via ws
   │    └─ current provider: VolcEngine /api/v3/sauc/bigmodel_nostream
@@ -134,7 +134,7 @@ Slash commands:
 /voice start    # start recording
 /voice stop     # stop, transcribe, insert text
 /voice toggle   # start if idle, stop if recording
-/voice cancel   # stop recording without transcribing
+/voice cancel   # stop recording and discard local audio without transcribing
 /voice status   # show recorder state
 /voice config   # show effective non-secret config and whether API key is detected
 /voice init     # create or normalize ~/.pi/agent/voice-input.config.json
@@ -144,9 +144,11 @@ Slash commands:
 
 ## Notes
 
-- The extension uses post-recording WebSocket ASR: it records locally first, then sends the stopped recording in chunks. It is optimized for fast voice input, not live subtitles.
+- The extension uses post-recording WebSocket ASR: it records locally to a per-run temporary WAV, sends the stopped recording in chunks, then deletes the temporary audio. It is optimized for fast voice input, not live subtitles.
 - The default ASR segment size is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
+- Recorder stdout/stderr is not logged to disk, to avoid retaining potentially sensitive runtime data.
+- On startup, legacy `~/.pi/agent/voice-input/recordings` and `~/.pi/agent/voice-input/logs` artifacts are cleaned up when they are not part of an active recording.
 - When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text. The final text is still pasted at the current cursor position without replacing the draft.
 - While recording, the status line shows `● Mic on: [device name] — press Ctrl+Shift+R again to stop/transcribe` in the current theme accent color; no separate popup is shown when recording starts.
 
