@@ -314,7 +314,7 @@ function recordingDeviceName(config: VoiceConfig, recorderExecutable: string): s
 }
 
 function recordingStatusText(deviceName: string): string {
-  return `Recording with ${deviceName || "default microphone"}`;
+  return `● Mic on: ${deviceName || "default microphone"}`;
 }
 
 function readState(config: VoiceConfig): RecordingState | null {
@@ -905,7 +905,7 @@ async function startRecording(ctx: ExtensionContext) {
   if (existing && pidAlive(existing.pid)) {
     const deviceName = existing.deviceName || recordingDeviceName(config, commandExists("pw-record") ? "pw-record" : "arecord");
     ctx.ui.notify(`Already recording: pid=${existing.pid}. ${recordingStatusText(deviceName)}`, "warning");
-    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", recordingStatusText(deviceName)));
+    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("accent", recordingStatusText(deviceName)));
     return;
   }
   if (existing) clearState(config);
@@ -936,7 +936,7 @@ async function startRecording(ctx: ExtensionContext) {
     deviceName,
   });
 
-  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", recordingStatusText(deviceName)));
+  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("accent", recordingStatusText(deviceName)));
   ctx.ui.notify(`${recordingStatusText(deviceName)}. Press Ctrl+Shift+R again to stop/transcribe.`, "info");
 }
 
