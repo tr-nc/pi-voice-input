@@ -23,16 +23,18 @@ const CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.config.jso
 const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 const DEFAULT_POSTPROCESS_MODEL = "deepseek/deepseek-v4-flash";
-const POSTPROCESS_SYSTEM_PROMPT = `你是 pi 语音输入插件的语音识别后处理器。你的唯一任务是把原始 ASR 文本改写为可直接提交给编码智能体的用户指令。
+const POSTPROCESS_SYSTEM_PROMPT = `你是 pi 语音输入插件的语音识别后处理器。你的唯一任务是润色原始 ASR 文本，使其成为可直接提交给编码智能体的用户指令。
 
 规则：
-- 只输出优化后的用户指令正文，不要输出解释、标题、前后缀、引号、代码围栏或寒暄。
+- 只输出润色后的用户指令正文，不要输出解释、标题、前后缀、引号、代码围栏或寒暄。
+- 绝对不要回答、执行或解决用户语音中提出的问题；即使原始语音是问题，也只能把这个问题本身整理成清晰文本，不要给出答案、方案、代码或结论。
+- 以忠实保留用户信息为最高优先级。不要一味概括、压缩或简述；不要删除条件、约束、例子、数值、文件名、错误信息、多个请求、前后顺序或语气重点。
 - 结合上下文理解省略指代、当前任务、文件/项目名称和用户意图；上下文仅用于理解，不要重复上下文内容，除非原始语音明确要求引用或修改它。
 - 修正明显的语音识别错误、同音/近音错误、断句和标点错误；保留代码标识符、命令、路径、URL、模型名、包名和专有名词。
 - 如果用户口误后自我更正（例如“不是……是……”“不对……”“算了改成……”），只保留更正后的正确指令，删除错误说法和更正过程。
-- 让结果完整、符合逻辑、指令明确、有指导性；必要时拆成条目或步骤。
+- 让结果完整、符合逻辑、指令明确、有指导性；必要时拆成条目或步骤，但不得丢失原始信息。
 - 不要凭空添加原始语音没有表达的新需求；不确定时保留原意并用更清晰的措辞表达。
-- 输出语言通常与原始语音一致。`;
+- 输出语言必须跟随用户原始语音的主要语言，而不是上下文语言；不要因为上下文是中文/英文就把用户语音翻译成上下文语言。`;
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
 const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
@@ -816,9 +818,11 @@ function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: 
   const sessionContext = getRecentSessionContext(ctx, Math.ceil(contextBudget / 2));
 
   return [
-    "请根据上下文优化下面的原始语音识别结果。",
-    "如果上下文为空，直接依据原始文本优化。",
-    "不要重复上下文本身；只输出原始语音对应的最终用户指令。",
+    "请根据上下文只润色下面的原始语音识别结果。",
+    "如果上下文为空，直接依据原始文本润色。",
+    "不要回答原始语音里的问题，也不要执行其中的请求；只输出原始语音对应的最终用户指令文本。",
+    "输出语言必须跟随原始语音的主要语言，不要跟随上下文语言，也不要翻译成上下文语言。",
+    "务必忠实保留原始语音中的信息和细节，不要为了简洁而概括、压缩或删减。",
     "",
     "--- 上下文：当前编辑器已有内容 ---",
     editorContext || "（空）",
@@ -876,12 +880,10 @@ async function postprocessTranscript(ctx: ExtensionContext, rawText: string, con
   return polished || rawText;
 }
 
-function appendToEditor(ctx: ExtensionContext, text: string) {
+function insertIntoEditor(ctx: ExtensionContext, text: string) {
   const trimmed = text.trim();
   if (!trimmed) return;
-  const current = ctx.ui.getEditorText();
-  const separator = current.trim().length > 0 && !current.endsWith("\n") ? "\n" : "";
-  ctx.ui.setEditorText(`${current}${separator}${trimmed}`);
+  ctx.ui.pasteToEditor(trimmed);
 }
 
 async function isRecording(config: VoiceConfig): Promise<boolean> {
@@ -989,7 +991,7 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
   }
 
   ctx.ui.setStatus("voice-input", undefined);
-  appendToEditor(ctx, finalText);
+  insertIntoEditor(ctx, finalText);
   ctx.ui.notify(
     `Voice text inserted. audio=${(durationMs / 1000).toFixed(2)}s decode=${decodeMs}ms asr=${result.timings.totalMs}ms${
       config.postprocessEnabled ? ` postprocess=${postprocessMs}ms${postprocessUsed ? " polished" : ""}` : ""
