@@ -148,7 +148,7 @@ Slash commands:
 - The default ASR segment size is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
 - When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text. The final text is still pasted at the current cursor position without replacing the draft.
-- While recording, the status line shows `● Mic on: [device name]` in the current theme accent color.
+- While recording, the status line shows `● Mic on: [device name] — press Ctrl+Shift+R again to stop/transcribe` in the current theme accent color; no separate popup is shown when recording starts.
 
 ## Development
 

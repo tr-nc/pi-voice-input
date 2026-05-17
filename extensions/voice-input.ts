@@ -326,7 +326,7 @@ function recordingDeviceName(config: VoiceConfig, recorderExecutable: string): s
 }
 
 function recordingStatusText(deviceName: string): string {
-  return `● Mic on: ${deviceName || "default microphone"}`;
+  return `● Mic on: ${deviceName || "default microphone"} — press Ctrl+Shift+R again to stop/transcribe`;
 }
 
 function readState(config: VoiceConfig): RecordingState | null {
@@ -949,7 +949,6 @@ async function startRecording(ctx: ExtensionContext) {
   });
 
   ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("accent", recordingStatusText(deviceName)));
-  ctx.ui.notify(`${recordingStatusText(deviceName)}. Press Ctrl+Shift+R again to stop/transcribe.`, "info");
 }
 
 async function stopRecording(ctx: ExtensionContext, transcribe = true) {
