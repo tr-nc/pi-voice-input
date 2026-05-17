@@ -34,7 +34,9 @@ Check that `npm pack --dry-run` includes only publishable files, normally:
 
 ```text
 AGENTS.md
+CONTRIBUTING.md
 README.md
+ROADMAP.md
 extensions/voice-input.ts
 package.json
 ```
@@ -62,22 +64,23 @@ Use conventional commit messages, for example:
 
 ## Release workflow
 
-1. Bump `package.json` version. npm versions are immutable.
-2. Validate with the commands above.
-3. Commit with a conventional commit message.
-4. Push to GitHub:
+Use the project release script for normal releases. It takes exactly one argument: the next package version.
 
 ```bash
-git push origin main
+scripts/release.sh <version>
 ```
 
-5. Publish to npm:
+Example:
 
 ```bash
-npm publish --access public
+scripts/release.sh 0.2.7
 ```
 
-6. Update the local installed pi package and verify startup:
+The script updates `package.json`, installs dependencies without writing a lockfile, runs validation, checks the package tarball, scans for likely secrets, commits, pushes to GitHub, publishes to npm with public access, and prints npm package metadata.
+
+Do not manually run separate commit/push/publish steps unless the script is broken or the user explicitly asks for a manual release path. npm versions are immutable, so always choose a new version.
+
+After publishing, update the local installed pi package from npm and verify startup:
 
 ```bash
 pi update npm:pi-voice-input

@@ -152,6 +152,8 @@ Slash commands:
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, validation commands, and pull request expectations.
+
 Clone the repo and install dependencies:
 
 ```bash

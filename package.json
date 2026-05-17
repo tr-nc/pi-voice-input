@@ -28,6 +28,7 @@
   "files": [
     "extensions",
     "README.md",
+    "CONTRIBUTING.md",
     "ROADMAP.md",
     "AGENTS.md"
   ],
