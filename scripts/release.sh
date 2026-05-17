@@ -40,7 +40,11 @@ rg -n "${secret_key_pattern}|${uuid_pattern}" \
 
 git diff --check
 git add package.json README.md ROADMAP.md AGENTS.md extensions scripts
-git commit -m "release voice input $version"
-git push origin HEAD
+if git diff --cached --quiet; then
+  echo "no release commit needed; package.json is already at $version"
+else
+  git commit -m "release voice input $version"
+  git push origin HEAD
+fi
 npm publish --access public
 npm view pi-voice-input version description --json
