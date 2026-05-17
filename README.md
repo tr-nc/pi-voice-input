@@ -1,11 +1,17 @@
 # pi Voice Input
 
-A publishable, pure TypeScript [pi](https://pi.dev/) extension for local voice input.
+A publishable, pure TypeScript [pi](https://pi.dev/) extension for Linux voice dictation into pi's editor.
 
 - Press `Ctrl+Shift+R` once to start recording.
 - Press `Ctrl+Shift+R` again to stop.
-- The extension sends the audio to an ASR provider.
+- The extension sends the audio to VolcEngine WebSocket ASR.
 - The recognized text is inserted into pi's editor without submitting.
+
+Current scope:
+
+- Linux only for now, using `pw-record` from PipeWire tools or `arecord` from alsa-utils.
+- A VolcEngine Speech API key is required.
+- This is not a local/offline ASR engine.
 
 The provider layer is intended to be extensible. **Current version supports only VolcEngine WebSocket ASR.**
 
@@ -24,8 +30,8 @@ pi extension: extensions/voice-input.ts
   ├─ sends PCM frames to the configured ASR provider via ws
   │    └─ current provider: VolcEngine /api/v3/sauc/bigmodel_nostream
   ├─ optionally post-processes raw ASR text with a configured pi model
-  │    └─ default: deepseek/deepseek-v4-flash, no reasoning option
-  └─ appends the final transcript to pi's editor with ctx.ui.setEditorText()
+  │    └─ default: disabled; set polishModel to enable it
+  └─ pastes the final transcript into pi's editor
 ```
 
 Runtime package dependency:
@@ -89,11 +95,11 @@ The config file is plain JSON and can be edited directly:
 ```json
 {
   "volcApiKey": "",
-  "polishModel": "deepseek/deepseek-v4-flash"
+  "polishModel": ""
 }
 ```
 
-`polishModel` is resolved from pi's model registry, so any model shown by `pi --list-models` can be used. Leave it empty to disable polish. If polishing fails, the raw ASR transcript is inserted instead.
+`polishModel` is disabled by default. Set it to any model shown by `pi --list-models` to enable transcript polish. If polishing fails, the raw ASR transcript is inserted instead.
 
 Verify the effective non-secret config:
 
@@ -128,7 +134,7 @@ Slash commands:
 - The extension uses post-recording WebSocket ASR: it records locally first, then sends the stopped recording in chunks. It is optimized for fast voice input, not live subtitles.
 - The default ASR segment size is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
-- When `polishModel` is set, polishing uses the current editor content and recent session messages as context, but outputs only the refined user instruction.
+- When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text. The final text is still pasted at the current cursor position without replacing the draft.
 - While recording, the status line and tool panel show `Recording with [device name]`.
 
 ## Development
@@ -158,6 +164,10 @@ After changing the extension while pi is open, run:
 ```text
 /reload
 ```
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned user-visible work, including macOS support.
 
 ## Links
 
