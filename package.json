@@ -1,6 +1,6 @@
 {
   "name": "pi-voice-input",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Press Ctrl+Shift+R to dictate prompts into Pi using VolcEngine ASR",
   "type": "module",
   "keywords": [

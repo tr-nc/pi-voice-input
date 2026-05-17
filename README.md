@@ -43,13 +43,21 @@ System dependency, one of:
 - `pw-record` from PipeWire tools, preferred
 - `arecord` from alsa-utils, fallback
 
-## Install
+## Install / Update
 
 Install the published package with pi:
 
 ```bash
 pi install npm:pi-voice-input
 ```
+
+Update to the latest published version:
+
+```bash
+pi update npm:pi-voice-input
+```
+
+If pi is already running, restart pi after installing or updating. `/reload` may not replace code that was already loaded by the current pi process.
 
 ## Providers
 
@@ -135,7 +143,7 @@ Slash commands:
 - The default ASR segment size is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
 - When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text. The final text is still pasted at the current cursor position without replacing the draft.
-- While recording, the status line and tool panel show `Recording with [device name]`.
+- While recording, the status line shows `● Mic on: [device name]` in the current theme accent color.
 
 ## Development
 

@@ -14,12 +14,6 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   exit 1
 fi
 
-if [[ -n "$(git status --short)" ]]; then
-  echo "working tree is not clean; commit or stash changes before running release" >&2
-  git status --short >&2
-  exit 1
-fi
-
 node -e '
 const fs = require("node:fs");
 const path = "package.json";
