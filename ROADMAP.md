@@ -5,23 +5,22 @@ This roadmap lists user-visible work planned for pi Voice Input. It is intention
 ## Current support
 
 - Linux voice input through `pw-record` or `arecord`
+- macOS voice input through the system `afrecord` command
 - VolcEngine WebSocket ASR
 - Optional transcript polish through a configured pi model
 
 ## Planned
 
-### macOS support
+### Validate and refine macOS support
 
-Add first-class macOS recording support so users can dictate into pi without PipeWire or ALSA.
+The macOS recording path is implemented with `afrecord`, but it still needs hands-on validation on macOS hardware.
 
-Expected direction:
+Expected follow-up:
 
-- use a macOS-native recording command or a small bundled recorder helper
-- keep the existing user workflow: press `Ctrl+Shift+R` to start, press it again to stop and insert text
-- document required microphone permissions clearly
-- preserve the same config file and ASR provider behavior where possible
-
-Status: planned, not yet implemented.
+- confirm microphone permission prompts and recovery steps
+- confirm produced WAV files are compatible across supported macOS versions
+- refine device naming and setup diagnostics if needed
+- preserve the same config file and ASR provider behavior
 
 ## Later candidates
 

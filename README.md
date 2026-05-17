@@ -1,6 +1,6 @@
 # pi Voice Input
 
-A publishable, pure TypeScript [pi](https://pi.dev/) extension for Linux voice dictation into pi's editor.
+A publishable, pure TypeScript [pi](https://pi.dev/) extension for Linux and macOS voice dictation into pi's editor.
 
 - Press `Ctrl+Shift+R` once to start recording.
 - Press `Ctrl+Shift+R` again to stop.
@@ -9,7 +9,8 @@ A publishable, pure TypeScript [pi](https://pi.dev/) extension for Linux voice d
 
 Current scope:
 
-- Linux only for now, using `pw-record` from PipeWire tools or `arecord` from alsa-utils.
+- Linux uses `pw-record` from PipeWire tools or `arecord` from alsa-utils.
+- macOS uses the system `afrecord` command. This path is implemented but not yet validated by the maintainer on macOS hardware.
 - A VolcEngine Speech API key is required.
 - This is not a local/offline ASR engine.
 
@@ -23,8 +24,9 @@ No Python, `uv`, upload service, or `ffmpeg` is required for normal shortcut usa
 pi extension: extensions/voice-input.ts
   ├─ registers Ctrl+Shift+R and /voice commands
   ├─ starts/stops a local recorder process
-  │    ├─ preferred: pw-record
-  │    └─ fallback: arecord
+  │    ├─ Linux preferred: pw-record
+  │    ├─ Linux fallback: arecord
+  │    └─ macOS: afrecord
   ├─ records 16 kHz mono 16-bit WAV
   ├─ parses the WAV container in TypeScript and extracts raw PCM
   ├─ sends PCM frames to the configured ASR provider via ws
@@ -40,8 +42,11 @@ Runtime package dependency:
 
 System dependency, one of:
 
-- `pw-record` from PipeWire tools, preferred
-- `arecord` from alsa-utils, fallback
+- Linux: `pw-record` from PipeWire tools, preferred
+- Linux: `arecord` from alsa-utils, fallback
+- macOS: `afrecord`, included with macOS
+
+On macOS, grant Terminal or your pi host app microphone permission when prompted. If macOS has previously denied microphone access, enable it in System Settings → Privacy & Security → Microphone.
 
 ## Install / Update
 
@@ -175,7 +180,7 @@ After changing the extension while pi is open, run:
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned user-visible work, including macOS support.
+See [ROADMAP.md](ROADMAP.md) for planned user-visible work.
 
 ## Links
 

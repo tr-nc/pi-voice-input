@@ -14,7 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import path from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import WebSocket from "ws";
@@ -212,17 +212,28 @@ function commandOutput(command: string, args: string[], timeoutMs = 1500): strin
   return (result.stdout || "").trim();
 }
 
+function selectRecorderExecutable(): string {
+  if (platform() === "darwin" && commandExists("afrecord")) return "afrecord";
+  if (commandExists("pw-record")) return "pw-record";
+  if (commandExists("arecord")) return "arecord";
+  return "";
+}
+
 function recorderCommand(config: VoiceConfig, outputPath: string): string[] {
-  if (commandExists("pw-record")) {
+  const executable = selectRecorderExecutable();
+  if (executable === "pw-record") {
     const cmd = ["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16"];
     if (config.recorderTarget) cmd.push("--target", config.recorderTarget);
     cmd.push(outputPath);
     return cmd;
   }
-  if (commandExists("arecord")) {
+  if (executable === "arecord") {
     return ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", outputPath];
   }
-  throw new Error("No recorder found. Install PipeWire tools (pw-record) or alsa-utils (arecord).");
+  if (executable === "afrecord") {
+    return ["afrecord", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", outputPath];
+  }
+  throw new Error("No recorder found. On Linux, install PipeWire tools (pw-record) or alsa-utils (arecord). On macOS, afrecord should be available with the system.");
 }
 
 type PipeWireSource = {
@@ -310,6 +321,7 @@ function pipeWireSourceName(target: string): string {
 function recordingDeviceName(config: VoiceConfig, recorderExecutable: string): string {
   if (recorderExecutable === "pw-record") return pipeWireSourceName(config.recorderTarget);
   if (recorderExecutable === "arecord") return "ALSA default microphone";
+  if (recorderExecutable === "afrecord") return "macOS default microphone";
   return config.recorderTarget || "default microphone";
 }
 
@@ -903,7 +915,7 @@ async function startRecording(ctx: ExtensionContext) {
   const config = getConfig();
   const existing = readState(config);
   if (existing && pidAlive(existing.pid)) {
-    const deviceName = existing.deviceName || recordingDeviceName(config, commandExists("pw-record") ? "pw-record" : "arecord");
+    const deviceName = existing.deviceName || recordingDeviceName(config, selectRecorderExecutable());
     ctx.ui.notify(`Already recording: pid=${existing.pid}. ${recordingStatusText(deviceName)}`, "warning");
     ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("accent", recordingStatusText(deviceName)));
     return;
@@ -1054,7 +1066,7 @@ async function configureApiKey(ctx: ExtensionContext, providedKey = "") {
 }
 
 function configSummary(config: VoiceConfig): string {
-  const recorderExecutable = commandExists("pw-record") ? "pw-record" : commandExists("arecord") ? "arecord" : "";
+  const recorderExecutable = selectRecorderExecutable();
   const currentDevice = recorderExecutable ? recordingDeviceName(config, recorderExecutable) : "no recorder found";
   return [
     "Voice input config:",
