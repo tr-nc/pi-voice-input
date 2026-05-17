@@ -149,7 +149,7 @@ Slash commands:
 - The transcript is inserted into the editor only; it is not submitted automatically.
 - Recorder stdout/stderr is not logged to disk, to avoid retaining potentially sensitive runtime data.
 - On startup, legacy `~/.pi/agent/voice-input/recordings` and `~/.pi/agent/voice-input/logs` artifacts are cleaned up when they are not part of an active recording.
-- When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text. The final text is still pasted at the current cursor position without replacing the draft.
+- When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text to insert at the current cursor. It must not reconstruct the full draft; the final text is pasted without replacing existing editor content.
 - While recording, the status line shows `● Mic on: [device name] — press Ctrl+Shift+R again to stop/transcribe` in the current theme accent color; no separate popup is shown when recording starts.
 
 ## Development

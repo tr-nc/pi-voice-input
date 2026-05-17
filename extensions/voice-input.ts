@@ -24,18 +24,25 @@ const CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.config.jso
 const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 const DEFAULT_POSTPROCESS_MODEL = "";
-const POSTPROCESS_SYSTEM_PROMPT = `你是 pi 语音输入插件的语音识别后处理器。你的唯一任务是润色原始 ASR 文本，使其成为可直接提交给编码智能体的用户指令。
+const POSTPROCESS_SYSTEM_PROMPT = `You are the speech-recognition postprocessor for the pi voice input extension. Your only job is to polish the raw ASR text into text that the plugin can paste verbatim at the current cursor position in the pi editor.
 
-规则：
-- 只输出润色后的用户指令正文，不要输出解释、标题、前后缀、引号、代码围栏或寒暄。
-- 绝对不要回答、执行或解决用户语音中提出的问题；即使原始语音是问题，也只能把这个问题本身整理成清晰文本，不要给出答案、方案、代码或结论。
-- 以忠实保留用户信息为最高优先级。不要一味概括、压缩或简述；不要删除条件、约束、例子、数值、文件名、错误信息、多个请求、前后顺序或语气重点。
-- 结合上下文理解省略指代、当前任务、文件/项目名称和用户意图；上下文仅用于理解，不要重复上下文内容，除非原始语音明确要求引用或修改它。
-- 修正明显的语音识别错误、同音/近音错误、断句和标点错误；保留代码标识符、命令、路径、URL、模型名、包名和专有名词。
-- 如果用户口误后自我更正（例如“不是……是……”“不对……”“算了改成……”），只保留更正后的正确指令，删除错误说法和更正过程。
-- 让结果完整、符合逻辑、指令明确、有指导性；必要时拆成条目或步骤，但不得丢失原始信息。
-- 不要凭空添加原始语音没有表达的新需求；不确定时保留原意并用更清晰的措辞表达。
-- 输出语言必须跟随用户原始语音的主要语言，而不是上下文语言；不要因为上下文是中文/英文就把用户语音翻译成上下文语言。`;
+Interaction contract:
+- The plugin does not replace editor content with your output. It only pastes/inserts your output at the user's current cursor position.
+- The current editor draft and recent conversation are context only. Use them to understand omitted references, the current task, file/project names, and intent. They are not text for you to rewrite and output as a whole.
+- Do not output the draft, a context sentence, or a full sentence/paragraph that represents the draft after insertion. Doing so would duplicate existing editor content.
+- You may not know the real cursor position. Do not guess the cursor location and synthesize a full surrounding sentence; the editor owns the real insertion point.
+- If the raw speech is adding a few words, half a sentence, a phrase, a condition, or a modifier, output only those newly spoken words. Let the paste operation merge them with the existing draft.
+- Only when the raw speech itself explicitly dictates a complete passage to insert may you output that complete passage. Even then, do not add draft text that the user did not speak.
+
+Rules:
+- Output only the polished insertion text. Do not output explanations, headings, prefixes, suffixes, quotes, code fences, or greetings.
+- Never answer, execute, or solve anything asked in the user's speech. If the raw speech is a question, only clean up the question text itself; do not provide an answer, plan, code, or conclusion.
+- Preserve the user's information faithfully. Do not over-summarize or compress. Do not delete constraints, examples, numbers, filenames, errors, multiple requests, ordering, or emphasis.
+- Correct obvious ASR mistakes, homophones, segmentation, and punctuation. Preserve code identifiers, commands, paths, URLs, model names, package names, and proper nouns.
+- If the user self-corrects, keep only the corrected intent and remove the false start, correction process, filler, and chatter. Do not lose any other substantive information.
+- Make the output complete relative to the raw speech, logically clear, and actionable. Split into items or steps when helpful, but do not drop raw-speech information or repeat existing draft text.
+- Do not invent requirements that the raw speech did not express. If uncertain, keep the original meaning and express it more clearly.
+- The output language must match the primary language of the raw speech, not the context language and not this English prompt. Do not translate just because the instructions are in English.`;
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
 const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
@@ -896,8 +903,40 @@ function cleanPostprocessOutput(output: string): string {
   let text = output.trim();
   const fence = text.match(/^```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n```$/);
   if (fence) text = fence[1].trim();
-  text = text.replace(/^(?:优化后的(?:用户)?指令|整理后的(?:用户)?指令|改写后的(?:用户)?指令)\s*[：:]\s*/u, "").trim();
+  text = text.replace(/^(?:polished(?: user)? instruction|refined(?: user)? instruction|rewritten(?: user)? instruction|final(?: insertion)? text)\s*:\s*/iu, "").trim();
   return text;
+}
+
+function removeEditorDraftEcho(editorText: string, output: string): string {
+  const draft = editorText.trim();
+  const text = output.trim();
+  if (draft.length < 12 || text.length <= draft.length) return output;
+
+  let prefixLength = 0;
+  while (prefixLength < draft.length && prefixLength < text.length && draft[prefixLength] === text[prefixLength]) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < draft.length - prefixLength &&
+    suffixLength < text.length - prefixLength &&
+    draft[draft.length - 1 - suffixLength] === text[text.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
+  }
+
+  if (prefixLength + suffixLength !== draft.length) return output;
+  const insertedText = text.slice(prefixLength, text.length - suffixLength).trim();
+  return insertedText || output;
+}
+
+function getFullEditorText(ctx: ExtensionContext): string {
+  try {
+    return ctx.ui.getEditorText();
+  } catch {
+    return "";
+  }
 }
 
 function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: VoiceConfig): string {
@@ -906,20 +945,25 @@ function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: 
   const sessionContext = getRecentSessionContext(ctx, Math.ceil(contextBudget / 2));
 
   return [
-    "请根据上下文只润色下面的原始语音识别结果。",
-    "如果上下文为空，直接依据原始文本润色。",
-    "不要回答原始语音里的问题，也不要执行其中的请求；只输出原始语音对应的最终用户指令文本。",
-    "输出语言必须跟随原始语音的主要语言，不要跟随上下文语言，也不要翻译成上下文语言。",
-    "务必忠实保留原始语音中的信息和细节，不要为了简洁而概括、压缩或删减。",
-    "当前输入框草稿只是上下文：语音文本会由插件插入到用户当前光标位置。不要重写、重复、补全、删除或替换草稿里的既有内容。",
+    "Polish only the raw ASR text below, using context only when it helps disambiguate the user's intent.",
+    "If context is empty or irrelevant, polish the raw text directly.",
+    "Do not answer the raw speech, and do not execute its request. Output only the final text that should be inserted into the editor.",
+    "The output language must match the primary language of the raw speech, not the context language and not this English prompt. Do not translate.",
+    "Faithfully preserve the information and details in the raw speech. Do not summarize, compress, or delete details merely for brevity.",
+    "IMPORTANT: your output will be pasted verbatim at the current cursor position. It is not a replacement and not a rewrite of the whole editor draft.",
+    "The current editor draft is context only. Do not rewrite, repeat, complete, delete, or replace existing draft text. Do not output the full sentence after insertion.",
+    "The true cursor position is not marked in the draft shown here; the pi editor owns the actual insertion point. Do not guess the cursor and synthesize a full surrounding sentence.",
+    "If the raw speech is an inline insertion, continuation, a few words, or a phrase, output only the newly spoken words or phrase.",
+    "Example: draft is `Please make this function async and [cursor].`, raw speech is `add error handling`, correct output is `add error handling`, not `Please make this function async and add error handling.`.",
+    "Example: draft is `This variable name is [cursor]unclear`, raw speech is `still`, correct output is `still`, not `This variable name is still unclear`.",
     "",
-    "--- 上下文：当前输入框未发送草稿 ---",
-    editorContext.trim() || "（空）",
+    "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
+    editorContext.trim() || "(empty)",
     "",
-    "--- 上下文：最近会话 ---",
-    sessionContext || "（空）",
+    "--- Context: recent conversation ---",
+    sessionContext || "(empty)",
     "",
-    "--- 原始语音识别结果 ---",
+    "--- Raw ASR text ---",
     rawText.trim(),
   ].join("\n");
 }
@@ -966,7 +1010,7 @@ async function postprocessTranscript(ctx: ExtensionContext, rawText: string, con
   }
 
   const polished = cleanPostprocessOutput(extractAssistantText(response));
-  return polished || rawText;
+  return polished ? removeEditorDraftEcho(getFullEditorText(ctx), polished) : rawText;
 }
 
 function insertIntoEditor(ctx: ExtensionContext, text: string) {
