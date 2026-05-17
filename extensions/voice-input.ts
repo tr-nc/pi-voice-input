@@ -16,13 +16,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { gzipSync, gunzipSync } from "node:zlib";
 import WebSocket from "ws";
 
-const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
-const PACKAGE_ROOT = path.resolve(EXTENSION_DIR, "..");
-const PRIVATE_CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.env");
+const CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.config.json");
 const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 const DEFAULT_POSTPROCESS_MODEL = "deepseek/deepseek-v4-flash";
@@ -47,9 +44,15 @@ const SERIALIZATION_NONE = 0b0000;
 const SERIALIZATION_JSON = 0b0001;
 const COMPRESSION_GZIP = 0b0001;
 
-type EnvMap = Record<string, string>;
+type JsonObject = Record<string, unknown>;
+
+type VoiceInputConfigFile = {
+  volcApiKey: string;
+  polishModel: string;
+};
 
 type VoiceConfig = {
+  configPath: string;
   apiKey: string;
   wsUrl: string;
   resourceId: string;
@@ -81,6 +84,7 @@ type RecordingState = {
   logPath: string;
   startedAt: string;
   recorderTarget?: string;
+  deviceName?: string;
 };
 
 type DecodedFrame = {
@@ -102,148 +106,94 @@ type TranscriptionResult = {
   };
 };
 
-function parseEnvText(text: string): EnvMap {
-  const env: EnvMap = {};
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) continue;
-    const key = match[1];
-    let value = match[2] ?? "";
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    env[key] = value;
-  }
-  return env;
-}
-
-function loadEnvFiles(): EnvMap {
-  const candidates = [
-    PRIVATE_CONFIG_PATH,
-    path.join(PACKAGE_ROOT, ".env"),
-    path.join(process.cwd(), ".env"),
-  ];
-  const merged: EnvMap = {};
-  for (const file of candidates) {
-    if (!existsSync(file)) continue;
-    Object.assign(merged, parseEnvText(readFileSync(file, "utf8")));
-  }
-  return merged;
-}
-
-function setting(env: EnvMap, name: string, fallback = ""): string {
-  const value = process.env[name] ?? env[name];
-  return value == null ? fallback : value;
-}
-
-function settingAny(env: EnvMap, names: string[], fallback = ""): string {
-  for (const name of names) {
-    const value = process.env[name] ?? env[name];
-    if (value != null && value !== "") return value;
-  }
-  return fallback;
-}
-
-function boolSetting(env: EnvMap, name: string, fallback: boolean): boolean {
-  const raw = setting(env, name, fallback ? "true" : "false").trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(raw)) return true;
-  if (["0", "false", "no", "off"].includes(raw)) return false;
-  return fallback;
-}
-
-function numberSetting(env: EnvMap, name: string, fallback: number): number {
-  const raw = setting(env, name, String(fallback)).trim();
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : fallback;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function expandHome(value: string): string {
-  if (value === "~") return homedir();
-  if (value.startsWith("~/")) return path.join(homedir(), value.slice(2));
-  return value;
-}
-
-function resolvePath(value: string, baseDir: string): string {
-  const expanded = expandHome(value);
-  return path.isAbsolute(expanded) ? expanded : path.resolve(baseDir, expanded);
-}
-
-function getConfig(): VoiceConfig {
-  const env = loadEnvFiles();
-  const defaultHome = path.join(homedir(), ".pi", "agent", "voice-input");
-  const voiceHome = resolvePath(setting(env, "VOICE_INPUT_HOME", defaultHome), process.cwd());
-
-  return {
-    apiKey: settingAny(env, ["VOLC_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_ASR_API_KEY"]).trim(),
-    wsUrl: setting(env, "VOLC_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream").trim(),
-    resourceId: setting(env, "VOLC_STREAM_RESOURCE_ID", "volc.seedasr.sauc.duration").trim(),
-    language: settingAny(env, ["ASR_LANGUAGE", "VOLC_ASR_LANGUAGE"], "").trim(),
-    uid: setting(env, "ASR_UID", "pi-voice-input").trim(),
-    prompt: setting(env, "ASR_PROMPT", "").trim(),
-    segmentMs: clamp(Math.round(numberSetting(env, "STREAM_SEGMENT_MS", 5000)), 100, 20000),
-    requestTimeoutMs: clamp(Math.round(numberSetting(env, "ASR_REQUEST_TIMEOUT_MS", 90000)), 1000, 10 * 60 * 1000),
-    finalizeDelayMs: clamp(numberSetting(env, "RECORDING_FINALIZE_DELAY", 0.1) * 1000, 0, 5000),
-    recorderTarget: setting(env, "RECORDER_TARGET", "").trim(),
-    recordingsDir: resolvePath(setting(env, "RECORDINGS_DIR", "recordings"), voiceHome),
-    statePath: resolvePath(setting(env, "RECORDER_STATE", "recording.json"), voiceHome),
-    logDir: resolvePath(setting(env, "RECORDER_LOG_DIR", "logs"), voiceHome),
-    shortcut: setting(env, "VOICE_INPUT_SHORTCUT", DEFAULT_SHORTCUT).trim() || DEFAULT_SHORTCUT,
-    enableItn: boolSetting(env, "ENABLE_ITN", true),
-    enablePunc: boolSetting(env, "ENABLE_PUNC", true),
-    enableDdc: boolSetting(env, "ENABLE_DDC", false),
-    showUtterances: boolSetting(env, "SHOW_UTTERANCES", false),
-    postprocessEnabled: boolSetting(env, "VOICE_POSTPROCESS_ENABLED", true),
-    postprocessModel: setting(env, "VOICE_POSTPROCESS_MODEL", DEFAULT_POSTPROCESS_MODEL).trim() || DEFAULT_POSTPROCESS_MODEL,
-    postprocessTimeoutMs: clamp(
-      Math.round(numberSetting(env, "VOICE_POSTPROCESS_TIMEOUT_MS", 30000)),
-      1000,
-      10 * 60 * 1000,
-    ),
-    postprocessMaxTokens: clamp(Math.round(numberSetting(env, "VOICE_POSTPROCESS_MAX_TOKENS", 2048)), 128, 32768),
-    postprocessContextChars: clamp(Math.round(numberSetting(env, "VOICE_POSTPROCESS_CONTEXT_CHARS", 6000)), 0, 50000),
-  };
-}
-
 function ensureDir(dir: string) {
   mkdirSync(dir, { recursive: true });
 }
 
-function envValue(value: string): string {
-  if (/^[A-Za-z0-9_./:@+-]*$/.test(value)) return value;
-  return JSON.stringify(value);
+function defaultConfigFile(): VoiceInputConfigFile {
+  return {
+    volcApiKey: "",
+    polishModel: DEFAULT_POSTPROCESS_MODEL,
+  };
 }
 
-function writePrivateEnvValue(name: string, value: string) {
-  if (/\r|\n/.test(value)) throw new Error(`${name} must be a single-line value`);
-  ensureDir(path.dirname(PRIVATE_CONFIG_PATH));
+function isObject(value: unknown): value is JsonObject {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
 
-  const original = existsSync(PRIVATE_CONFIG_PATH) ? readFileSync(PRIVATE_CONFIG_PATH, "utf8") : "";
-  const lines = original ? original.split(/\r?\n/) : [];
-  const replacement = `${name}=${envValue(value)}`;
-  let replaced = false;
+function stringField(source: JsonObject, name: string, fallback: string): string {
+  const value = source[name];
+  return typeof value === "string" ? value : fallback;
+}
 
-  const nextLines = lines.map((line) => {
-    if (new RegExp(`^\\s*${name}\\s*=`).test(line)) {
-      replaced = true;
-      return replacement;
-    }
-    return line;
-  });
+function normalizeConfigFile(input: unknown): VoiceInputConfigFile {
+  const defaults = defaultConfigFile();
+  const root = isObject(input) ? input : {};
+  return {
+    volcApiKey: stringField(root, "volcApiKey", defaults.volcApiKey).trim(),
+    polishModel: stringField(root, "polishModel", defaults.polishModel).trim(),
+  };
+}
 
-  if (!replaced) {
-    if (nextLines.length > 0 && nextLines[nextLines.length - 1] !== "") nextLines.push("");
-    nextLines.push("# Managed by pi-voice-input. You can also update this with /voice key.");
-    nextLines.push(replacement);
+function writeConfigFile(config: unknown) {
+  ensureDir(path.dirname(CONFIG_PATH));
+  writeFileSync(CONFIG_PATH, `${JSON.stringify(normalizeConfigFile(config), null, 2)}\n`, { mode: 0o600 });
+  chmodSync(CONFIG_PATH, 0o600);
+}
+
+function loadConfigFile(): VoiceInputConfigFile {
+  if (!existsSync(CONFIG_PATH)) return defaultConfigFile();
+  try {
+    return normalizeConfigFile(JSON.parse(readFileSync(CONFIG_PATH, "utf8")));
+  } catch (error) {
+    throw new Error(`Failed to read voice input config ${CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
 
-  writeFileSync(PRIVATE_CONFIG_PATH, nextLines.join("\n").replace(/\n*$/, "\n"), { mode: 0o600 });
-  chmodSync(PRIVATE_CONFIG_PATH, 0o600);
+function getConfig(): VoiceConfig {
+  const fileConfig = loadConfigFile();
+  const voiceHome = path.join(homedir(), ".pi", "agent", "voice-input");
+  const polishModel = fileConfig.polishModel.trim();
+
+  return {
+    configPath: CONFIG_PATH,
+    apiKey: fileConfig.volcApiKey.trim(),
+    wsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream",
+    resourceId: "volc.seedasr.sauc.duration",
+    language: "",
+    uid: "pi-voice-input",
+    prompt: "",
+    segmentMs: 5000,
+    requestTimeoutMs: 90000,
+    finalizeDelayMs: 100,
+    recorderTarget: "",
+    recordingsDir: path.join(voiceHome, "recordings"),
+    statePath: path.join(voiceHome, "recording.json"),
+    logDir: path.join(voiceHome, "logs"),
+    shortcut: DEFAULT_SHORTCUT,
+    enableItn: true,
+    enablePunc: true,
+    enableDdc: false,
+    showUtterances: false,
+    postprocessEnabled: polishModel.length > 0,
+    postprocessModel: polishModel,
+    postprocessTimeoutMs: 30000,
+    postprocessMaxTokens: 2048,
+    postprocessContextChars: 6000,
+  };
+}
+
+function ensureConfigFile(): boolean {
+  const existed = existsSync(CONFIG_PATH);
+  writeConfigFile(loadConfigFile());
+  return !existed;
+}
+
+function writeConfigApiKey(apiKey: string) {
+  if (/\r|\n/.test(apiKey)) throw new Error("volcApiKey must be a single-line value");
+  const config = loadConfigFile();
+  config.volcApiKey = apiKey.trim();
+  writeConfigFile(config);
 }
 
 function timestampForFilename(): string {
@@ -252,6 +202,12 @@ function timestampForFilename(): string {
 
 function commandExists(command: string): boolean {
   return spawnSync("sh", ["-lc", `command -v ${command}`], { stdio: "ignore" }).status === 0;
+}
+
+function commandOutput(command: string, args: string[], timeoutMs = 1500): string {
+  const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs });
+  if (result.status !== 0) return "";
+  return (result.stdout || "").trim();
 }
 
 function recorderCommand(config: VoiceConfig, outputPath: string): string[] {
@@ -265,6 +221,98 @@ function recorderCommand(config: VoiceConfig, outputPath: string): string[] {
     return ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", outputPath];
   }
   throw new Error("No recorder found. Install PipeWire tools (pw-record) or alsa-utils (arecord).");
+}
+
+type PipeWireSource = {
+  id: string;
+  name: string;
+  description: string;
+};
+
+function parsePactlSources(text: string): PipeWireSource[] {
+  const sources: PipeWireSource[] = [];
+  let current: PipeWireSource | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    const sourceMatch = line.match(/^Source #(\S+)/);
+    if (sourceMatch) {
+      if (current) sources.push(current);
+      current = { id: sourceMatch[1], name: "", description: "" };
+      continue;
+    }
+    if (!current) continue;
+    const nameMatch = line.match(/^\s*Name:\s*(.+)$/);
+    if (nameMatch) {
+      current.name = nameMatch[1].trim();
+      continue;
+    }
+    const descriptionMatch = line.match(/^\s*Description:\s*(.+)$/);
+    if (descriptionMatch) current.description = descriptionMatch[1].trim();
+  }
+  if (current) sources.push(current);
+  return sources;
+}
+
+function wpctlProperty(text: string, property: string): string {
+  const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = text.match(new RegExp(`(?:^|\\n)\\s*\\*?\\s*${escaped}\\s*=\\s*"([^"]+)"`));
+  return match?.[1]?.trim() ?? "";
+}
+
+function inspectPipeWireSource(target: string): string {
+  if (!commandExists("wpctl")) return "";
+  const inspect = commandOutput("wpctl", ["inspect", target]);
+  return (
+    wpctlProperty(inspect, "node.description") ||
+    wpctlProperty(inspect, "node.nick") ||
+    wpctlProperty(inspect, "node.name")
+  );
+}
+
+function defaultPipeWireSourceFromStatus(): string {
+  if (!commandExists("wpctl")) return "";
+  const status = commandOutput("wpctl", ["status"]);
+  let inSources = false;
+  for (const line of status.split(/\r?\n/)) {
+    if (/Sources:/.test(line)) {
+      inSources = true;
+      continue;
+    }
+    if (inSources && /^\s*[├└]─/.test(line)) break;
+    if (!inSources) continue;
+    const match = line.match(/^\s*│\s+\*\s+\d+\.\s+(.+?)(?:\s+\[|$)/);
+    if (match) return match[1].trim();
+  }
+  return "";
+}
+
+function pipeWireSourceName(target: string): string {
+  const sources = commandExists("pactl") ? parsePactlSources(commandOutput("pactl", ["list", "sources"])) : [];
+
+  if (!target) {
+    const defaultName = commandExists("pactl") ? commandOutput("pactl", ["get-default-source"]) : "";
+    const source = sources.find((item) => item.name === defaultName);
+    return (
+      source?.description ||
+      source?.name ||
+      inspectPipeWireSource("@DEFAULT_SOURCE@") ||
+      defaultPipeWireSourceFromStatus() ||
+      defaultName ||
+      "default microphone"
+    );
+  }
+
+  const source = sources.find((item) => item.id === target || item.name === target || item.description === target);
+  return source?.description || source?.name || (/^\d+$/.test(target) ? inspectPipeWireSource(target) : "") || target;
+}
+
+function recordingDeviceName(config: VoiceConfig, recorderExecutable: string): string {
+  if (recorderExecutable === "pw-record") return pipeWireSourceName(config.recorderTarget);
+  if (recorderExecutable === "arecord") return "ALSA default microphone";
+  return config.recorderTarget || "default microphone";
+}
+
+function recordingStatusText(deviceName: string): string {
+  return `Recording with ${deviceName || "default microphone"}`;
 }
 
 function readState(config: VoiceConfig): RecordingState | null {
@@ -483,8 +531,9 @@ function parseRecordedWav(filePath: string): { pcm: Buffer; durationMs: number }
 
 function missingCredentialsMessage(): string {
   return [
-    "Missing VOLC_API_KEY for the current VolcEngine ASR provider.",
+    "Missing VolcEngine API key in the pi voice input config.",
     "Run /voice key and paste your VolcEngine Speech API key.",
+    `Config file: ${CONFIG_PATH}`,
     `Get/create the key here: ${VOLC_API_KEY_URL}`,
     "Run /voice config to verify whether the key is detected.",
   ].join("\n");
@@ -700,7 +749,7 @@ function modelLabel(model: Model<Api>): string {
 
 function resolvePostprocessModel(ctx: ExtensionContext, reference: string): Model<Api> {
   const requested = stripThinkingSuffix(reference.trim());
-  if (!requested) throw new Error("VOICE_POSTPROCESS_MODEL is empty");
+  if (!requested) throw new Error("polishModel is empty in voice input config");
 
   const models = ctx.modelRegistry.getAll();
   const lower = requested.toLowerCase();
@@ -844,8 +893,9 @@ async function startRecording(ctx: ExtensionContext) {
   const config = getConfig();
   const existing = readState(config);
   if (existing && pidAlive(existing.pid)) {
-    ctx.ui.notify(`Already recording: pid=${existing.pid}`, "warning");
-    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", "● recording"));
+    const deviceName = existing.deviceName || recordingDeviceName(config, commandExists("pw-record") ? "pw-record" : "arecord");
+    ctx.ui.notify(`Already recording: pid=${existing.pid}. ${recordingStatusText(deviceName)}`, "warning");
+    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", recordingStatusText(deviceName)));
     return;
   }
   if (existing) clearState(config);
@@ -855,6 +905,7 @@ async function startRecording(ctx: ExtensionContext) {
   const outputPath = path.join(config.recordingsDir, `recording-${timestampForFilename()}.wav`);
   const logPath = path.join(config.logDir, `recording-${timestampForFilename()}.log`);
   const cmd = recorderCommand(config, outputPath);
+  const deviceName = recordingDeviceName(config, cmd[0]);
 
   ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● starting mic"));
   const logFd = openSync(logPath, "a");
@@ -872,10 +923,11 @@ async function startRecording(ctx: ExtensionContext) {
     logPath,
     startedAt: new Date().toISOString(),
     recorderTarget: config.recorderTarget || undefined,
+    deviceName,
   });
 
-  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", "● recording"));
-  ctx.ui.notify("Voice recording started. Press Ctrl+Shift+R again to stop/transcribe.", "info");
+  ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("error", recordingStatusText(deviceName)));
+  ctx.ui.notify(`${recordingStatusText(deviceName)}. Press Ctrl+Shift+R again to stop/transcribe.`, "info");
 }
 
 async function stopRecording(ctx: ExtensionContext, transcribe = true) {
@@ -960,9 +1012,11 @@ function setupHelp(config = getConfig()): string {
   return [
     "pi Voice Input setup:",
     "- Current provider: VolcEngine WebSocket ASR",
+    `- Config file: ${config.configPath}`,
     `- API key: ${config.apiKey ? "set" : "missing"}`,
+    "- To create/update the JSON config file, run: /voice init",
     "- To save/update the key, run: /voice key",
-    `- Postprocess: ${config.postprocessEnabled ? "enabled" : "disabled"} (${config.postprocessModel})`,
+    `- Polish: ${config.postprocessEnabled ? config.postprocessModel : "disabled"}`,
     `- Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
     "- After saving the key, run: /voice config",
   ].join("\n");
@@ -973,12 +1027,12 @@ async function configureApiKey(ctx: ExtensionContext, providedKey = "") {
 
   if (!apiKey) {
     if (!ctx.hasUI) {
-      ctx.ui.notify(`Run /voice key in interactive pi, or get a key from ${VOLC_API_KEY_URL} and set VOLC_API_KEY.`, "error");
+      ctx.ui.notify(`Run /voice key in interactive pi, or edit ${CONFIG_PATH}. Get a key from ${VOLC_API_KEY_URL}.`, "error");
       return;
     }
     ctx.ui.notify(`Get/create a VolcEngine Speech API key here:\n${VOLC_API_KEY_URL}`, "info");
     const current = getConfig().apiKey;
-    const placeholder = current ? "Paste a new VolcEngine API key (current key is already set)" : "Paste VOLC_API_KEY";
+    const placeholder = current ? "Paste a new VolcEngine API key (current key is already set)" : "Paste VolcEngine API key";
     apiKey = (await ctx.ui.input("VolcEngine API key", placeholder))?.trim() ?? "";
   }
 
@@ -987,29 +1041,21 @@ async function configureApiKey(ctx: ExtensionContext, providedKey = "") {
     return;
   }
 
-  writePrivateEnvValue("VOLC_API_KEY", apiKey);
-  ctx.ui.notify("VolcEngine API key saved for pi voice input. Run /voice config to verify it is detected.", "info");
+  writeConfigApiKey(apiKey);
+  ctx.ui.notify(`VolcEngine API key saved in ${CONFIG_PATH}. Run /voice config to verify it is detected.`, "info");
 }
 
 function configSummary(config: VoiceConfig): string {
+  const recorderExecutable = commandExists("pw-record") ? "pw-record" : commandExists("arecord") ? "arecord" : "";
+  const currentDevice = recorderExecutable ? recordingDeviceName(config, recorderExecutable) : "no recorder found";
   return [
     "Voice input config:",
-    `- api key: ${config.apiKey ? "set" : "missing"} (update with /voice key)`,
-    `- ws url: ${config.wsUrl}`,
-    `- resource id: ${config.resourceId}`,
-    `- language: ${config.language || "auto"}`,
-    `- recorder target: ${config.recorderTarget || "PipeWire/default"}`,
-    `- segment: ${config.segmentMs}ms`,
-    `- recordings: ${config.recordingsDir}`,
-    `- state: ${config.statePath}`,
-    `- shortcut: ${config.shortcut}`,
-    `- postprocess: ${config.postprocessEnabled ? "enabled" : "disabled"}`,
-    `- postprocess model: ${config.postprocessModel}`,
-    "- postprocess thinking: off",
-    `- postprocess timeout: ${config.postprocessTimeoutMs}ms`,
-    "Run /voice key to save/update the current provider API key.",
+    `- config file: ${config.configPath}${existsSync(config.configPath) ? "" : " (missing; run /voice init to create it)"}`,
+    `- volcApiKey: ${config.apiKey ? "set" : "missing"} (update with /voice key)`,
+    `- polishModel: ${config.postprocessEnabled ? config.postprocessModel : "disabled"}`,
+    `- current recording device: ${currentDevice}`,
+    "Config keys: volcApiKey, polishModel. Leave polishModel empty to disable polish.",
     `VolcEngine API key URL: ${VOLC_API_KEY_URL}`,
-    "Config files checked: ~/.pi/agent/voice-input.env, package .env, current .env; shell env overrides them.",
   ].join("\n");
 }
 
@@ -1029,7 +1075,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("voice", {
-    description: "Voice input: start | stop | status | toggle | cancel | config | key | help",
+    description: "Voice input: start | stop | status | toggle | cancel | config | init | key | help",
     handler: async (args, ctx) => {
       const input = (args || "toggle").trim();
       const action = (input.split(/\s+/, 1)[0] || "toggle").toLowerCase();
@@ -1057,6 +1103,11 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(configSummary(getConfig()), "info");
           return;
         }
+        if (action === "init") {
+          const created = ensureConfigFile();
+          ctx.ui.notify(`${created ? "Created" : "Updated"} voice input config: ${CONFIG_PATH}`, "info");
+          return;
+        }
         if (["key", "api-key", "apikey", "setup", "configure"].includes(action)) {
           await configureApiKey(ctx, rest);
           return;
@@ -1069,7 +1120,7 @@ export default function (pi: ExtensionAPI) {
           await toggleRecording(ctx);
           return;
         }
-        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config | key | help", "error");
+        ctx.ui.notify("Usage: /voice start | stop | status | toggle | cancel | config | init | key | help", "error");
       } catch (error) {
         ctx.ui.setStatus("voice-input", undefined);
         ctx.ui.notify(`Voice command error: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -1085,7 +1136,8 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(
       [
         `Voice input loaded: ${startupConfig.shortcut} toggles recording.`,
-        "API key is missing. Run /voice key to set it up.",
+        "API key is missing. Run /voice key to set it up, or edit the JSON config file.",
+        `Config file: ${startupConfig.configPath}`,
         `Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
       ].join("\n"),
       "warning",

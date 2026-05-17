@@ -58,38 +58,48 @@ Planned provider direction:
 - add more ASR providers without changing the shortcut/user workflow
 - keep provider credentials and options isolated in config
 
-## Configure credentials
+## Configure
 
-In pi, run:
+All plugin settings live in one JSON file:
+
+```text
+~/.pi/agent/voice-input.config.json
+```
+
+Package-local and project-local env files are not read.
+
+Create or normalize the file from inside pi:
+
+```text
+/voice init
+```
+
+Then set the VolcEngine Speech API key:
 
 ```text
 /voice key
 ```
 
-Paste your VolcEngine Speech API key into the prompt. The extension saves it for future sessions and keeps it out of your project files.
-
-You can get/manage the key here:
+The key URL is also shown inside pi when the key is missing, when you run `/voice key`, and in `/voice help`:
 
 https://console.volcengine.com/speech/new/setting/apikeys?projectName=default
 
-The key URL is also shown inside pi when the key is missing, when you run `/voice key`, and in `/voice help`:
+The config file is plain JSON and can be edited directly:
 
-Then verify:
+```json
+{
+  "volcApiKey": "",
+  "polishModel": "deepseek/deepseek-v4-flash"
+}
+```
+
+`polishModel` is resolved from pi's model registry, so any model shown by `pi --list-models` can be used. Leave it empty to disable polish. If polishing fails, the raw ASR transcript is inserted instead.
+
+Verify the effective non-secret config:
 
 ```text
 /voice config
 ```
-
-## Configure post-processing
-
-By default, recognized text is polished before insertion with pi's existing `deepseek/deepseek-v4-flash` model. Configure it in `~/.pi/agent/voice-input.env`:
-
-```env
-VOICE_POSTPROCESS_ENABLED=true
-VOICE_POSTPROCESS_MODEL=deepseek/deepseek-v4-flash
-```
-
-`VOICE_POSTPROCESS_MODEL` is resolved from pi's model registry, so any model shown by `pi --list-models` can be used. If post-processing fails, the raw ASR transcript is inserted instead.
 
 ## Usage
 
@@ -108,6 +118,7 @@ Slash commands:
 /voice cancel   # stop recording without transcribing
 /voice status   # show recorder state
 /voice config   # show effective non-secret config and whether API key is detected
+/voice init     # create or normalize ~/.pi/agent/voice-input.config.json
 /voice key      # prompt for and save the current provider API key
 /voice help     # show setup help, including the explicit VolcEngine API key URL
 ```
@@ -115,9 +126,10 @@ Slash commands:
 ## Notes
 
 - The extension uses post-recording WebSocket ASR: it records locally first, then sends the stopped recording in chunks. It is optimized for fast voice input, not live subtitles.
-- The default `STREAM_SEGMENT_MS=5000` is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
+- The default ASR segment size is intentionally larger than realtime packet sizes because this workflow sends already-recorded audio.
 - The transcript is inserted into the editor only; it is not submitted automatically.
-- Post-processing uses the current editor content and recent session messages as context, but outputs only the refined user instruction.
+- When `polishModel` is set, polishing uses the current editor content and recent session messages as context, but outputs only the refined user instruction.
+- While recording, the status line and tool panel show `Recording with [device name]`.
 
 ## Development
 

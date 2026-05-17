@@ -13,8 +13,8 @@ Development workflow for this repo.
 
 ## Secrets and local data
 
-- Never commit API keys, `.env`, recordings, logs, caches, or `node_modules`.
-- User credentials belong in `~/.pi/agent/voice-input.env`, usually written by `/voice key`.
+- Never commit API keys, `.env`, local config JSON, recordings, logs, caches, or `node_modules`.
+- User credentials and plugin settings belong in `~/.pi/agent/voice-input.config.json`, usually written by `/voice key` or `/voice init`.
 - Do not print or copy real API keys into commits, docs, tests, or command output.
 - The explicit VolcEngine API key URL that should be shown to users is:
   `https://console.volcengine.com/speech/new/setting/apikeys?projectName=default`
@@ -33,7 +33,6 @@ npm pack --dry-run
 Check that `npm pack --dry-run` includes only publishable files, normally:
 
 ```text
-.env.example
 AGENTS.md
 README.md
 extensions/voice-input.ts
@@ -50,7 +49,7 @@ Then check:
 
 ```bash
 git status --short
-rg -n "VOLC_API_KEY=|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" \
+rg -n '"volcApiKey"\\s*:\\s*"[^"]+"|VOLC_API_KEY=|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
   --glob '!node_modules/**' --glob '!package-lock.json' . || true
 ```
 

@@ -1,7 +1,7 @@
 node_modules/
 .env
 .env.*
-!.env.example
+voice-input.config.json
 logs/
 recordings/
 .DS_Store

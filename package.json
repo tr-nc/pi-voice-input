@@ -1,6 +1,6 @@
 {
   "name": "pi-voice-input",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "provider-extensible voice input extension for pi",
   "type": "module",
   "keywords": [
@@ -23,7 +23,6 @@
   "homepage": "https://github.com/tr-nc/pi-voice-input#readme",
   "files": [
     "extensions",
-    ".env.example",
     "README.md",
     "AGENTS.md"
   ],
