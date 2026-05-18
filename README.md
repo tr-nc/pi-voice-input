@@ -10,13 +10,13 @@ A publishable, pure TypeScript [pi](https://pi.dev/) extension for Linux and mac
 Current scope:
 
 - Linux uses `pw-record` from PipeWire tools or `arecord` from alsa-utils.
-- macOS uses the system `afrecord` command. This path is implemented but not yet validated by the maintainer on macOS hardware.
+- macOS uses `afrecord` when present, otherwise `ffmpeg` with AVFoundation.
 - A VolcEngine Speech API key is required.
 - This is not a local/offline ASR engine.
 
 The provider layer is intended to be extensible. **Current version supports only VolcEngine WebSocket ASR.**
 
-No Python, `uv`, upload service, or `ffmpeg` is required for normal shortcut usage.
+No Python, `uv`, or upload service is required for normal shortcut usage. On macOS systems without `afrecord`, install `ffmpeg` for recording.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ pi extension: extensions/voice-input.ts
   ├─ starts/stops a local recorder process
   │    ├─ Linux preferred: pw-record
   │    ├─ Linux fallback: arecord
-  │    └─ macOS: afrecord
+  │    └─ macOS: afrecord, or ffmpeg/AVFoundation fallback
   ├─ records a temporary 16 kHz mono 16-bit WAV
   ├─ parses the WAV container in TypeScript and extracts raw PCM
   ├─ sends PCM frames to the configured ASR provider via ws
@@ -44,9 +44,9 @@ System dependency, one of:
 
 - Linux: `pw-record` from PipeWire tools, preferred
 - Linux: `arecord` from alsa-utils, fallback
-- macOS: `afrecord`, included with macOS
+- macOS: `afrecord` when present, or `ffmpeg` from Homebrew (`brew install ffmpeg`) as the AVFoundation fallback
 
-On macOS, grant Terminal or your pi host app microphone permission when prompted. If macOS has previously denied microphone access, enable it in System Settings → Privacy & Security → Microphone.
+On macOS, grant Terminal, ffmpeg, or your pi host app microphone permission when prompted. If macOS has previously denied microphone access, enable it in System Settings → Privacy & Security → Microphone.
 
 ## Install / Update
 

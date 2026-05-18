@@ -217,7 +217,10 @@ function commandOutput(command: string, args: string[], timeoutMs = 1500): strin
 }
 
 function selectRecorderExecutable(): string {
-  if (platform() === "darwin" && commandExists("afrecord")) return "afrecord";
+  if (platform() === "darwin") {
+    if (commandExists("afrecord")) return "afrecord";
+    if (commandExists("ffmpeg")) return "ffmpeg";
+  }
   if (commandExists("pw-record")) return "pw-record";
   if (commandExists("arecord")) return "arecord";
   return "";
@@ -237,7 +240,31 @@ function recorderCommand(config: VoiceConfig, outputPath: string): string[] {
   if (executable === "afrecord") {
     return ["afrecord", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", outputPath];
   }
-  throw new Error("No recorder found. On Linux, install PipeWire tools (pw-record) or alsa-utils (arecord). On macOS, afrecord should be available with the system.");
+  if (executable === "ffmpeg" && platform() === "darwin") {
+    return [
+      "ffmpeg",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-nostdin",
+      "-y",
+      "-f",
+      "avfoundation",
+      "-i",
+      config.recorderTarget || "none:default",
+      "-vn",
+      "-acodec",
+      "pcm_s16le",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-f",
+      "wav",
+      outputPath,
+    ];
+  }
+  throw new Error("No recorder found. On Linux, install PipeWire tools (pw-record) or alsa-utils (arecord). On macOS, install ffmpeg (brew install ffmpeg) if afrecord is not available.");
 }
 
 type PipeWireSource = {
@@ -326,6 +353,7 @@ function recordingDeviceName(config: VoiceConfig, recorderExecutable: string): s
   if (recorderExecutable === "pw-record") return pipeWireSourceName(config.recorderTarget);
   if (recorderExecutable === "arecord") return "ALSA default microphone";
   if (recorderExecutable === "afrecord") return "macOS default microphone";
+  if (recorderExecutable === "ffmpeg" && platform() === "darwin") return "macOS default microphone (ffmpeg/AVFoundation)";
   return config.recorderTarget || "default microphone";
 }
 
