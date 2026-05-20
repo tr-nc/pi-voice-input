@@ -21,7 +21,7 @@ No Python, `uv`, or upload service is required for normal shortcut usage. On mac
 ## Architecture
 
 ```text
-pi extension: extensions/voice-input.ts
+pi extension: extensions/index.ts → extensions/voice-input.ts
   ├─ registers Ctrl+Shift+R and /voice commands
   ├─ starts/stops a local recorder process
   │    ├─ Linux preferred: pw-record
@@ -164,10 +164,10 @@ cd pi-voice-input
 npm install
 ```
 
-Run directly without installing the package:
+Run directly from the package checkout:
 
 ```bash
-pi -e ./extensions/voice-input.ts
+pi -e .
 ```
 
 Or install the local checkout while developing:

@@ -7,7 +7,8 @@ Development workflow for this repo.
 - Package: `pi-voice-input`
 - GitHub: `git@github.com:tr-nc/pi-voice-input.git`
 - npm: `pi-voice-input`
-- Main extension: `extensions/voice-input.ts`
+- Package entrypoint: `extensions/index.ts`
+- Main extension implementation: `extensions/voice-input.ts`
 - Current provider: VolcEngine WebSocket ASR only
 - Provider architecture should remain extensible so more ASR providers can be added later.
 
@@ -25,8 +26,8 @@ Run from the repo root:
 
 ```bash
 npm install --package-lock=false
-npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck --types node extensions/voice-input.ts
-PI_OFFLINE=1 pi -e ./extensions/voice-input.ts --list-models
+npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck --types node extensions/index.ts
+PI_OFFLINE=1 pi -e . --list-models
 npm pack --dry-run
 ```
 
@@ -37,6 +38,7 @@ AGENTS.md
 CONTRIBUTING.md
 README.md
 ROADMAP.md
+extensions/index.ts
 extensions/voice-input.ts
 package.json
 ```
@@ -90,7 +92,7 @@ PI_OFFLINE=1 pi --list-models
 If testing a local checkout instead of the npm package, use:
 
 ```bash
-pi -e ./extensions/voice-input.ts
+pi -e .
 ```
 
 Do not leave local development wrappers in `~/.pi/agent/extensions/voice-input.ts` when validating the npm installation path.

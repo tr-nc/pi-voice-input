@@ -41,10 +41,10 @@ cd pi-voice-input
 npm install
 ```
 
-Run the extension directly from the checkout:
+Run the package directly from the checkout:
 
 ```bash
-pi -e ./extensions/voice-input.ts
+pi -e .
 ```
 
 Or install the local checkout into pi while developing:
@@ -82,8 +82,8 @@ Do not commit this config file or any secrets.
 Before opening a pull request, run:
 
 ```bash
-npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck --types node extensions/voice-input.ts
-PI_OFFLINE=1 pi -e ./extensions/voice-input.ts --list-models
+npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck --types node extensions/index.ts
+PI_OFFLINE=1 pi -e . --list-models
 npm pack --dry-run
 git diff --check
 ```

@@ -24,8 +24,8 @@ fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
 ' "$version"
 
 npm install --package-lock=false
-npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck --types node extensions/voice-input.ts
-PI_OFFLINE=1 pi -e ./extensions/voice-input.ts --list-models >/tmp/pi-voice-input-list-models.out
+npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck --types node extensions/index.ts
+PI_OFFLINE=1 pi -e . --list-models >/tmp/pi-voice-input-list-models.out
 npm pack --dry-run
 secret_key_pattern='"volcApiKey"\\s*:\\s*"[^"]+"|VOLC_API''_KEY='
 uuid_pattern='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -33,7 +33,7 @@ rg -n "${secret_key_pattern}|${uuid_pattern}" \
   --glob '!node_modules/**' --glob '!package-lock.json' . || true
 
 git diff --check
-git add package.json README.md ROADMAP.md AGENTS.md extensions scripts
+git add package.json README.md CONTRIBUTING.md ROADMAP.md AGENTS.md extensions scripts
 if git diff --cached --quiet; then
   echo "no release commit needed; package.json is already at $version"
 else
