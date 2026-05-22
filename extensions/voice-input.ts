@@ -40,7 +40,9 @@ Rules:
 - Preserve the user's information faithfully. Do not over-summarize or compress. Do not delete constraints, examples, numbers, filenames, errors, multiple requests, ordering, or emphasis.
 - Correct obvious ASR mistakes, homophones, segmentation, and punctuation. Preserve code identifiers, commands, paths, URLs, model names, package names, and proper nouns.
 - If the user self-corrects, keep only the corrected intent and remove the false start, correction process, filler, and chatter. Do not lose any other substantive information.
-- Make the output complete relative to the raw speech, logically clear, and actionable. Split into items or steps when helpful, but do not drop raw-speech information or repeat existing draft text.
+- Make the output complete relative to the raw speech, logically clear, and actionable, but do not drop raw-speech information or repeat existing draft text.
+- Preserve the raw speech layout. If the raw speech is a single line, output a single line unless the user explicitly dictates line breaks or another multiline layout, for example by saying "new line" or "换行".
+- Do not introduce line breaks, bullets, numbered lists, tables, or code fences merely to improve style.
 - Do not invent requirements that the raw speech did not express. If uncertain, keep the original meaning and express it more clearly.
 - The output language must match the primary language of the raw speech, not the context language and not this English prompt. Do not translate just because the instructions are in English.`;
 
@@ -924,7 +926,18 @@ function resolvePostprocessModel(ctx: ExtensionContext, reference: string): Mode
 }
 
 function extractAssistantText(message: { content: unknown }): string {
-  return textFromContent(message.content).trim();
+  const content = message.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const block = part as { type?: unknown; text?: unknown };
+      if (block.type === "text" && typeof block.text === "string") return block.text;
+      return "";
+    })
+    .join("")
+    .trim();
 }
 
 function cleanPostprocessOutput(output: string): string {
@@ -933,6 +946,27 @@ function cleanPostprocessOutput(output: string): string {
   if (fence) text = fence[1].trim();
   text = text.replace(/^(?:polished(?: user)? instruction|refined(?: user)? instruction|rewritten(?: user)? instruction|final(?: insertion)? text)\s*:\s*/iu, "").trim();
   return text;
+}
+
+function rawTextRequestsMultiline(rawText: string): boolean {
+  return (
+    /\r|\n/.test(rawText) ||
+    /\b(?:new\s*line|newline|line break|next line|new paragraph|paragraph break|carriage return|press enter|separate lines?|multi[- ]line|multiple lines)\b/i.test(rawText) ||
+    /(?:换行|新的一行|另起一行|下一行|回车|分行|多行|逐行|每行|空一行|新段落|另起一段|分段)/u.test(rawText)
+  );
+}
+
+function collapseUnexpectedLineBreaks(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]*\n+[ \t\f\v]*/g, " ")
+    .replace(/[ \t\f\v]{2,}/g, " ")
+    .trim();
+}
+
+function preserveExpectedPostprocessLayout(rawText: string, output: string): string {
+  if (rawTextRequestsMultiline(rawText)) return output.trim();
+  return collapseUnexpectedLineBreaks(output);
 }
 
 function removeEditorDraftEcho(editorText: string, output: string): string {
@@ -981,6 +1015,7 @@ function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: 
     "IMPORTANT: your output will be pasted verbatim at the current cursor position. It is not a replacement and not a rewrite of the whole editor draft.",
     "The current editor draft is context only. Do not rewrite, repeat, complete, delete, or replace existing draft text. Do not output the full sentence after insertion.",
     "The true cursor position is not marked in the draft shown here; the pi editor owns the actual insertion point. Do not guess the cursor and synthesize a full surrounding sentence.",
+    "Preserve layout: if the raw ASR text is one line, output one line unless the user explicitly dictated line breaks or another multiline layout.",
     "If the raw speech is an inline insertion, continuation, a few words, or a phrase, output only the newly spoken words or phrase.",
     "Example: draft is `Please make this function async and [cursor].`, raw speech is `add error handling`, correct output is `add error handling`, not `Please make this function async and add error handling.`.",
     "Example: draft is `This variable name is [cursor]unclear`, raw speech is `still`, correct output is `still`, not `This variable name is still unclear`.",
@@ -1038,7 +1073,9 @@ async function postprocessTranscript(ctx: ExtensionContext, rawText: string, con
   }
 
   const polished = cleanPostprocessOutput(extractAssistantText(response));
-  return polished ? removeEditorDraftEcho(getFullEditorText(ctx), polished) : rawText;
+  if (!polished) return rawText;
+  const insertion = removeEditorDraftEcho(getFullEditorText(ctx), polished);
+  return preserveExpectedPostprocessLayout(raw, insertion) || rawText;
 }
 
 function insertIntoEditor(ctx: ExtensionContext, text: string) {
