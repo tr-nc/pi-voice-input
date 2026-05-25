@@ -1362,8 +1362,8 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
   if (!result.text.trim()) {
     ctx.ui.setStatus("voice-input", undefined);
     ctx.ui.notify(
-      `Transcription finished but no text was returned. audio=${(durationMs / 1000).toFixed(2)}s total=${result.timings.totalMs}ms`,
-      "warning",
+      `No speech detected. audio=${(durationMs / 1000).toFixed(2)}s total=${result.timings.totalMs}ms`,
+      "info",
     );
     return;
   }
