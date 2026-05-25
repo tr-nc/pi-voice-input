@@ -61,6 +61,9 @@ type JsonObject = Record<string, unknown>;
 type VoiceInputConfigFile = {
   volcApiKey: string;
   polishModel: string;
+  duckSystemVolume: boolean;
+  duckSystemVolumeFactor: number;
+  duckSystemVolumeFadeMs: number;
 };
 
 type VoiceConfig = {
@@ -86,6 +89,17 @@ type VoiceConfig = {
   postprocessTimeoutMs: number;
   postprocessMaxTokens: number;
   postprocessContextChars: number;
+  duckSystemVolume: boolean;
+  duckSystemVolumeFactor: number;
+  duckSystemVolumeFadeMs: number;
+};
+
+type SystemVolumeDuckingState = {
+  provider: "macos" | "wpctl" | "pactl";
+  originalVolumePercent: number;
+  duckedVolumePercent: number;
+  factor: number;
+  fadeMs: number;
 };
 
 type RecordingState = {
@@ -95,6 +109,7 @@ type RecordingState = {
   startedAt: string;
   recorderTarget?: string;
   deviceName?: string;
+  systemVolume?: SystemVolumeDuckingState;
 };
 
 type DecodedFrame = {
@@ -124,6 +139,9 @@ function defaultConfigFile(): VoiceInputConfigFile {
   return {
     volcApiKey: "",
     polishModel: DEFAULT_POSTPROCESS_MODEL,
+    duckSystemVolume: true,
+    duckSystemVolumeFactor: 0.5,
+    duckSystemVolumeFadeMs: 300,
   };
 }
 
@@ -136,12 +154,29 @@ function stringField(source: JsonObject, name: string, fallback: string): string
   return typeof value === "string" ? value : fallback;
 }
 
+function booleanField(source: JsonObject, name: string, fallback: boolean): boolean {
+  const value = source[name];
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function numberField(source: JsonObject, name: string, fallback: number): number {
+  const value = source[name];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 function normalizeConfigFile(input: unknown): VoiceInputConfigFile {
   const defaults = defaultConfigFile();
   const root = isObject(input) ? input : {};
   return {
     volcApiKey: stringField(root, "volcApiKey", defaults.volcApiKey).trim(),
     polishModel: stringField(root, "polishModel", defaults.polishModel).trim(),
+    duckSystemVolume: booleanField(root, "duckSystemVolume", defaults.duckSystemVolume),
+    duckSystemVolumeFactor: clamp(numberField(root, "duckSystemVolumeFactor", defaults.duckSystemVolumeFactor), 0, 1),
+    duckSystemVolumeFadeMs: Math.round(clamp(numberField(root, "duckSystemVolumeFadeMs", defaults.duckSystemVolumeFadeMs), 0, 3000)),
   };
 }
 
@@ -188,6 +223,9 @@ function getConfig(): VoiceConfig {
     postprocessTimeoutMs: 30000,
     postprocessMaxTokens: 2048,
     postprocessContextChars: 6000,
+    duckSystemVolume: fileConfig.duckSystemVolume,
+    duckSystemVolumeFactor: fileConfig.duckSystemVolumeFactor,
+    duckSystemVolumeFadeMs: fileConfig.duckSystemVolumeFadeMs,
   };
 }
 
@@ -216,6 +254,111 @@ function commandOutput(command: string, args: string[], timeoutMs = 1500): strin
   const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs });
   if (result.status !== 0) return "";
   return (result.stdout || "").trim();
+}
+
+function runCommand(command: string, args: string[], timeoutMs = 1500): boolean {
+  return spawnSync(command, args, { stdio: "ignore", timeout: timeoutMs }).status === 0;
+}
+
+function formatPercent(value: number): string {
+  return Number(value.toFixed(2)).toString();
+}
+
+function readSystemOutputVolume(): Pick<SystemVolumeDuckingState, "provider" | "originalVolumePercent"> | null {
+  if (platform() === "darwin") {
+    if (!commandExists("osascript")) return null;
+    const output = commandOutput("osascript", ["-e", "output volume of (get volume settings)"]);
+    const volume = Number(output.trim());
+    return Number.isFinite(volume) ? { provider: "macos", originalVolumePercent: clamp(volume, 0, 100) } : null;
+  }
+
+  if (platform() !== "linux") return null;
+
+  if (commandExists("wpctl")) {
+    const output = commandOutput("wpctl", ["get-volume", "@DEFAULT_AUDIO_SINK@"]);
+    const match = output.match(/Volume:\s*([0-9.]+)/);
+    const volume = match ? Number(match[1]) * 100 : NaN;
+    if (Number.isFinite(volume)) return { provider: "wpctl", originalVolumePercent: Math.max(0, volume) };
+  }
+
+  if (commandExists("pactl")) {
+    const output = commandOutput("pactl", ["get-sink-volume", "@DEFAULT_SINK@"]);
+    const match = output.match(/([0-9]+(?:\.[0-9]+)?)%/);
+    const volume = match ? Number(match[1]) : NaN;
+    if (Number.isFinite(volume)) return { provider: "pactl", originalVolumePercent: Math.max(0, volume) };
+  }
+
+  return null;
+}
+
+function setSystemOutputVolume(state: Pick<SystemVolumeDuckingState, "provider">, volumePercent: number): boolean {
+  if (state.provider === "macos") {
+    return runCommand("osascript", ["-e", `set volume output volume ${Math.round(clamp(volumePercent, 0, 100))}`]);
+  }
+
+  const safePercent = Math.max(0, volumePercent);
+  if (state.provider === "wpctl") {
+    return runCommand("wpctl", ["set-volume", "@DEFAULT_AUDIO_SINK@", `${formatPercent(safePercent)}%`]);
+  }
+
+  return runCommand("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${formatPercent(safePercent)}%`]);
+}
+
+function easeInOut(t: number): number {
+  return 0.5 - Math.cos(Math.PI * clamp(t, 0, 1)) / 2;
+}
+
+async function fadeSystemOutputVolume(
+  state: Pick<SystemVolumeDuckingState, "provider">,
+  fromPercent: number,
+  toPercent: number,
+  fadeMs: number,
+): Promise<string | null> {
+  if (fadeMs <= 0 || Math.abs(fromPercent - toPercent) < 0.1) {
+    return setSystemOutputVolume(state, toPercent) ? null : "failed to set system output volume";
+  }
+
+  const steps = Math.max(2, Math.min(20, Math.round(fadeMs / 30)));
+  const intervalMs = fadeMs / steps;
+  for (let step = 1; step <= steps; step += 1) {
+    const eased = easeInOut(step / steps);
+    const volume = fromPercent + (toPercent - fromPercent) * eased;
+    if (!setSystemOutputVolume(state, volume)) return "failed to set system output volume";
+    if (step < steps) await sleep(intervalMs);
+  }
+  return null;
+}
+
+function createSystemVolumeDuckingState(config: VoiceConfig): { state?: SystemVolumeDuckingState; warning?: string } {
+  if (!config.duckSystemVolume || config.duckSystemVolumeFactor >= 1) return {};
+  const snapshot = readSystemOutputVolume();
+  if (!snapshot) return { warning: "system output volume ducking is enabled, but no supported volume control was found" };
+
+  return {
+    state: {
+      ...snapshot,
+      duckedVolumePercent: snapshot.originalVolumePercent * config.duckSystemVolumeFactor,
+      factor: config.duckSystemVolumeFactor,
+      fadeMs: config.duckSystemVolumeFadeMs,
+    },
+  };
+}
+
+async function applySystemVolumeDucking(state?: SystemVolumeDuckingState): Promise<string | null> {
+  if (!state) return null;
+  const warning = await fadeSystemOutputVolume(state, state.originalVolumePercent, state.duckedVolumePercent, state.fadeMs);
+  return warning ? `system output volume ducking failed: ${warning}` : null;
+}
+
+async function restoreSystemOutputVolume(state?: SystemVolumeDuckingState): Promise<string | null> {
+  if (!state) return null;
+  const warning = await fadeSystemOutputVolume(state, state.duckedVolumePercent, state.originalVolumePercent, state.fadeMs);
+  return warning ? `system output volume restore failed: ${warning}` : null;
+}
+
+function restoreSystemOutputVolumeNow(state?: SystemVolumeDuckingState): string | null {
+  if (!state) return null;
+  return setSystemOutputVolume(state, state.originalVolumePercent) ? null : "system output volume restore failed";
 }
 
 function selectRecorderExecutable(): string {
@@ -1092,9 +1235,10 @@ async function isRecording(config: VoiceConfig): Promise<boolean> {
 function cleanupStaleRecordingState(config: VoiceConfig): string[] {
   const state = readState(config);
   if (!state || pidAlive(state.pid)) return [];
+  const volumeWarning = restoreSystemOutputVolumeNow(state.systemVolume);
   const cleanupWarnings = cleanupRecordingArtifacts(state);
   clearState(config);
-  return cleanupWarnings;
+  return [volumeWarning, ...cleanupWarnings].filter((message): message is string => Boolean(message));
 }
 
 function requireInteractiveUi(ctx: ExtensionContext, action: string): boolean {
@@ -1128,6 +1272,7 @@ async function startRecording(ctx: ExtensionContext) {
     throw error;
   }
   const deviceName = recordingDeviceName(config, cmd[0]);
+  const volumeDucking = createSystemVolumeDuckingState(config);
 
   ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● starting mic"));
   let child: ReturnType<typeof spawn>;
@@ -1152,7 +1297,11 @@ async function startRecording(ctx: ExtensionContext) {
     startedAt: new Date().toISOString(),
     recorderTarget: config.recorderTarget || undefined,
     deviceName,
+    systemVolume: volumeDucking.state,
   });
+  if (volumeDucking.warning) ctx.ui.notify(`Voice input warning: ${volumeDucking.warning}`, "warning");
+  const duckingWarning = await applySystemVolumeDucking(volumeDucking.state);
+  if (duckingWarning) ctx.ui.notify(`Voice input warning: ${duckingWarning}`, "warning");
 
   ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("accent", recordingStatusText(deviceName)));
 }
@@ -1169,7 +1318,9 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
 
   ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", transcribe ? "● transcribing" : "● stopping"));
   if (pidAlive(state.pid)) await stopProcessGroup(state.pid);
+  const volumeRestoreWarning = await restoreSystemOutputVolume(state.systemVolume);
   clearState(config);
+  if (volumeRestoreWarning) ctx.ui.notify(`Voice input warning: ${volumeRestoreWarning}`, "warning");
   if (config.finalizeDelayMs > 0) await sleep(config.finalizeDelayMs);
 
   if (!transcribe) {
@@ -1262,6 +1413,7 @@ function setupHelp(config = getConfig()): string {
     "- To create/update the JSON config file, run: /voice init",
     "- To save/update the key, run: /voice key",
     `- Polish: ${config.postprocessEnabled ? config.postprocessModel : "disabled"}`,
+    `- System volume ducking: ${config.duckSystemVolume ? `${Math.round(config.duckSystemVolumeFactor * 100)}% over ${config.duckSystemVolumeFadeMs}ms` : "disabled"}`,
     `- Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
     "- After saving the key, run: /voice config",
   ].join("\n");
@@ -1298,8 +1450,11 @@ function configSummary(config: VoiceConfig): string {
     `- config file: ${config.configPath}${existsSync(config.configPath) ? "" : " (missing; run /voice init to create it)"}`,
     `- volcApiKey: ${config.apiKey ? "set" : "missing"} (update with /voice key)`,
     `- polishModel: ${config.postprocessEnabled ? config.postprocessModel : "disabled"}`,
+    `- duckSystemVolume: ${config.duckSystemVolume ? "enabled" : "disabled"}`,
+    `- duckSystemVolumeFactor: ${config.duckSystemVolumeFactor}`,
+    `- duckSystemVolumeFadeMs: ${config.duckSystemVolumeFadeMs}`,
     `- current recording device: ${currentDevice}`,
-    "Config keys: volcApiKey, polishModel. Leave polishModel empty to disable polish.",
+    "Config keys: volcApiKey, polishModel, duckSystemVolume, duckSystemVolumeFactor, duckSystemVolumeFadeMs. Leave polishModel empty to disable polish.",
     `VolcEngine API key URL: ${VOLC_API_KEY_URL}`,
   ].join("\n");
 }

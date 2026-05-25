@@ -27,6 +27,7 @@ pi extension: extensions/index.ts → extensions/voice-input.ts
   │    ├─ Linux preferred: pw-record
   │    ├─ Linux fallback: arecord
   │    └─ macOS: afrecord, or ffmpeg/AVFoundation fallback
+  ├─ ducks system output volume while the microphone is listening
   ├─ records a temporary 16 kHz mono 16-bit WAV
   ├─ parses the WAV container in TypeScript and extracts raw PCM
   ├─ sends PCM frames to the configured ASR provider via ws
@@ -108,11 +109,16 @@ The config file is plain JSON and can be edited directly:
 ```json
 {
   "volcApiKey": "",
-  "polishModel": ""
+  "polishModel": "",
+  "duckSystemVolume": true,
+  "duckSystemVolumeFactor": 0.5,
+  "duckSystemVolumeFadeMs": 300
 }
 ```
 
 `polishModel` is disabled by default. Set it to any model shown by `pi --list-models` to enable transcript polish. If polishing fails, the raw ASR transcript is inserted instead.
+
+`duckSystemVolume` is enabled by default. While recording, the extension lowers system output volume to `duckSystemVolumeFactor` of the original volume using a short ease-in/ease-out fade (`duckSystemVolumeFadeMs`), then restores the saved volume when recording stops or is cancelled. Linux uses `wpctl` or `pactl`; macOS uses `osascript`.
 
 Verify the effective non-secret config:
 
@@ -151,6 +157,7 @@ Slash commands:
 - On startup, legacy `~/.pi/agent/voice-input/recordings` and `~/.pi/agent/voice-input/logs` artifacts are cleaned up when they are not part of an active recording.
 - When `polishModel` is set, polishing uses the unsent editor draft and recent session messages as context, but outputs only the refined voice text to insert at the current cursor. It must not reconstruct the full draft; the final text is pasted without replacing existing editor content.
 - While recording, the status line shows `● Mic on: [device name] — press Ctrl+Shift+R again to stop/transcribe` in the current theme accent color; no separate popup is shown when recording starts.
+- By default, system output volume is ducked to 50% of its previous level with a 300 ms ease-in/ease-out fade while the microphone is listening, then restored after recording stops.
 
 ## Development
 
