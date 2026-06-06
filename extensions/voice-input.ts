@@ -1091,20 +1091,44 @@ function cleanPostprocessOutput(output: string): string {
   return text;
 }
 
+const EXPLICIT_ENGLISH_MULTILINE_PATTERN =
+  /\b(?:new\s*line|newline|line break|next line|new paragraph|paragraph break|carriage return|press enter|separate lines?|multi[- ]line|multiple lines)\b/i;
+const EXPLICIT_CHINESE_MULTILINE_PATTERN = /(?:换行|新的一行|另起一行|下一行|回车|分行|多行|逐行|每行|空一行|新段落|另起一段|分段)/u;
+const CJK_LIKE_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const CJK_PUNCTUATION_PATTERN = /[，。！？、；：（）《》「」『』“”‘’]/u;
+const CLOSING_PUNCTUATION_PATTERN = /^[,.;:!?，。！？、；：）)\]}》」』”’]/u;
+const OPENING_PUNCTUATION_PATTERN = /[（([{\[《「『“‘]$/u;
+
 function rawTextRequestsMultiline(rawText: string): boolean {
-  return (
-    /\r|\n/.test(rawText) ||
-    /\b(?:new\s*line|newline|line break|next line|new paragraph|paragraph break|carriage return|press enter|separate lines?|multi[- ]line|multiple lines)\b/i.test(rawText) ||
-    /(?:换行|新的一行|另起一行|下一行|回车|分行|多行|逐行|每行|空一行|新段落|另起一段|分段)/u.test(rawText)
-  );
+  // Existing newlines in raw ASR are not reliable user intent: providers can
+  // insert segment or sentence breaks on their own. Treat only spoken layout
+  // commands as intentional multiline input.
+  return EXPLICIT_ENGLISH_MULTILINE_PATTERN.test(rawText) || EXPLICIT_CHINESE_MULTILINE_PATTERN.test(rawText);
+}
+
+function lineBreakJoiner(left: string, right: string): string {
+  if (!left || !right) return "";
+  if (CLOSING_PUNCTUATION_PATTERN.test(right) || OPENING_PUNCTUATION_PATTERN.test(left)) return "";
+  if (CJK_PUNCTUATION_PATTERN.test(left) || CJK_PUNCTUATION_PATTERN.test(right)) return "";
+  if (CJK_LIKE_PATTERN.test(left) && CJK_LIKE_PATTERN.test(right)) return "";
+  return " ";
 }
 
 function collapseUnexpectedLineBreaks(text: string): string {
-  return text
-    .replace(/\r\n?/g, "\n")
-    .replace(/[ \t\f\v]*\n+[ \t\f\v]*/g, " ")
+  const normalized = text.replace(/\r\n?/g, "\n");
+  return normalized
+    .replace(/[ \t\f\v]*\n+[ \t\f\v]*/g, (match, offset: number, source: string) => {
+      const left = source.slice(0, offset).replace(/[ \t\f\v]+$/g, "").at(-1) ?? "";
+      const right = source.slice(offset + match.length).replace(/^[ \t\f\v]+/g, "").at(0) ?? "";
+      return lineBreakJoiner(left, right);
+    })
     .replace(/[ \t\f\v]{2,}/g, " ")
     .trim();
+}
+
+function normalizeRawTextForPostprocess(rawText: string): string {
+  const raw = rawText.trim();
+  return rawTextRequestsMultiline(raw) ? raw : collapseUnexpectedLineBreaks(raw);
 }
 
 function preserveExpectedPostprocessLayout(rawText: string, output: string): string {
@@ -1193,7 +1217,7 @@ async function postprocessTranscript(ctx: ExtensionContext, rawText: string, con
       messages: [
         {
           role: "user",
-          content: buildPostprocessPrompt(ctx, raw, config),
+          content: buildPostprocessPrompt(ctx, normalizeRawTextForPostprocess(raw), config),
           timestamp: Date.now(),
         },
       ],
@@ -1370,6 +1394,7 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
 
   let finalText = result.text;
   let postprocessMs = 0;
+  let postprocessSucceeded = false;
   let postprocessUsed = false;
   if (config.postprocessEnabled) {
     ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● polishing"));
@@ -1377,7 +1402,7 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
     try {
       finalText = await postprocessTranscript(ctx, result.text, config);
       postprocessMs = Date.now() - postprocessStart;
-      postprocessUsed = finalText.trim() !== result.text.trim();
+      postprocessSucceeded = true;
     } catch (error) {
       postprocessMs = Date.now() - postprocessStart;
       ctx.ui.notify(
@@ -1386,6 +1411,9 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
       );
     }
   }
+
+  finalText = preserveExpectedPostprocessLayout(result.text, finalText);
+  postprocessUsed = postprocessSucceeded && finalText.trim() !== result.text.trim();
 
   ctx.ui.setStatus("voice-input", undefined);
   insertIntoEditor(ctx, finalText);
