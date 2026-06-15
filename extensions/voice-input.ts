@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -24,6 +25,25 @@ const CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.config.jso
 const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 const DEFAULT_POSTPROCESS_MODEL = "";
+const DEFAULT_POSTPROCESS_CONTEXT_TOKENS = 20000;
+const POSTPROCESS_GIT_LOG_LIMIT = 10;
+const POSTPROCESS_DIRECTORY_DEPTH = 2;
+const POSTPROCESS_DIRECTORY_TOKENS = 20000;
+const SKIPPED_DIRECTORY_ENTRIES = new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  ".nuxt",
+  ".turbo",
+  ".cache",
+  "logs",
+  "recordings",
+]);
 const POSTPROCESS_SYSTEM_PROMPT = `You are the speech-recognition postprocessor for the pi voice input extension. Your only job is to polish the raw ASR text into text that the plugin can paste verbatim at the current cursor position in the pi editor.
 
 Interaction contract:
@@ -88,7 +108,7 @@ type VoiceConfig = {
   postprocessModel: string;
   postprocessTimeoutMs: number;
   postprocessMaxTokens: number;
-  postprocessContextChars: number;
+  postprocessContextTokens: number;
   duckSystemVolume: boolean;
   duckSystemVolumeFactor: number;
   duckSystemVolumeFadeMs: number;
@@ -222,7 +242,7 @@ function getConfig(): VoiceConfig {
     postprocessModel: polishModel,
     postprocessTimeoutMs: 30000,
     postprocessMaxTokens: 2048,
-    postprocessContextChars: 6000,
+    postprocessContextTokens: DEFAULT_POSTPROCESS_CONTEXT_TOKENS,
     duckSystemVolume: fileConfig.duckSystemVolume,
     duckSystemVolumeFactor: fileConfig.duckSystemVolumeFactor,
     duckSystemVolumeFadeMs: fileConfig.duckSystemVolumeFadeMs,
@@ -956,16 +976,77 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
   };
 }
 
-function tailText(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
-  return `…${text.slice(-maxChars)}`;
+function estimateTokens(text: string): number {
+  let tokens = 0;
+  let asciiRun = 0;
+  const flushAscii = () => {
+    if (asciiRun > 0) {
+      tokens += Math.ceil(asciiRun / 4);
+      asciiRun = 0;
+    }
+  };
+
+  for (const char of text) {
+    if (/\s/u.test(char)) {
+      flushAscii();
+    } else if (/[^\x00-\x7F]/u.test(char)) {
+      flushAscii();
+      tokens += 1;
+    } else {
+      asciiRun += 1;
+    }
+  }
+  flushAscii();
+  return tokens;
 }
 
-function truncateText(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}…`;
+function takeTokensFromStart(text: string, maxTokens: number): string {
+  if (maxTokens <= 0 || !text) return "";
+  if (estimateTokens(text) <= maxTokens) return text;
+
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateTokens(text.slice(0, mid)) <= maxTokens) low = mid;
+    else high = mid - 1;
+  }
+  return text.slice(0, low);
+}
+
+function takeTokensFromEnd(text: string, maxTokens: number): string {
+  if (maxTokens <= 0 || !text) return "";
+  if (estimateTokens(text) <= maxTokens) return text;
+
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateTokens(text.slice(text.length - mid)) <= maxTokens) low = mid;
+    else high = mid - 1;
+  }
+  return text.slice(text.length - low);
+}
+
+function limitTokensFromStart(text: string, maxTokens: number, marker = "\n…(truncated to fit token budget)"): string {
+  if (maxTokens <= 0) return "";
+  if (estimateTokens(text) <= maxTokens) return text;
+  const markerTokens = estimateTokens(marker);
+  return `${takeTokensFromStart(text, Math.max(0, maxTokens - markerTokens)).trimEnd()}${marker}`;
+}
+
+function limitTokensFromEnd(text: string, maxTokens: number, marker = "…(older context omitted to fit token budget)\n"): string {
+  if (maxTokens <= 0) return "";
+  if (estimateTokens(text) <= maxTokens) return text;
+  const markerTokens = estimateTokens(marker);
+  return `${marker}${takeTokensFromEnd(text, Math.max(0, maxTokens - markerTokens)).trimStart()}`;
+}
+
+function redactSensitiveText(text: string): string {
+  return text
+    .replace(/(\bVOLC_API_KEY\s*=\s*)[^\s"']+/giu, "$1[redacted]")
+    .replace(/((?:\b|["'])(?:volcApiKey|api[_-]?key|apikey|access[_-]?token|secret|password)(?:\b|["'])\s*[:=]\s*["']?)[^"'\s,}]+/giu, "$1[redacted]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu, "[redacted-uuid]");
 }
 
 function textFromContent(content: unknown): string {
@@ -982,27 +1063,163 @@ function textFromContent(content: unknown): string {
     .join("\n");
 }
 
-function getEditorContext(ctx: ExtensionContext, maxChars: number): string {
-  if (maxChars <= 0) return "";
+function getEditorContext(ctx: ExtensionContext): string {
   try {
-    return tailText(ctx.ui.getEditorText(), maxChars);
+    return redactSensitiveText(ctx.ui.getEditorText()).trim();
   } catch {
     return "";
   }
 }
 
-function getRecentSessionContext(ctx: ExtensionContext, maxChars: number): string {
-  if (maxChars <= 0) return "";
+function getRecentSessionContext(ctx: ExtensionContext): string {
   const lines: string[] = [];
   for (const entry of ctx.sessionManager.getBranch()) {
     if (entry.type !== "message") continue;
     const message = entry.message as { role?: unknown; content?: unknown };
     if (message.role !== "user" && message.role !== "assistant") continue;
-    const text = textFromContent(message.content).replace(/\s+/g, " ").trim();
+    const text = redactSensitiveText(textFromContent(message.content)).trim();
     if (!text) continue;
-    lines.push(`${message.role}: ${truncateText(text, 1200)}`);
+    lines.push(`${message.role}: ${text}`);
   }
-  return tailText(lines.slice(-8).join("\n"), maxChars);
+  return lines.join("\n\n");
+}
+
+function buildConversationContext(ctx: ExtensionContext, maxTokens: number): { editorContext: string; sessionContext: string } {
+  if (maxTokens <= 0) return { editorContext: "", sessionContext: "" };
+
+  const editorContext = getEditorContext(ctx);
+  const sessionContext = getRecentSessionContext(ctx);
+  const editorSection = [
+    "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
+    editorContext || "(empty)",
+  ].join("\n");
+  const sessionHeader = "--- Context: recent conversation ---\n";
+  const totalTokens = estimateTokens([editorSection, sessionHeader, sessionContext || "(empty)"].join("\n\n"));
+  if (totalTokens <= maxTokens) return { editorContext, sessionContext };
+
+  const editorTokenBudget = Math.min(5000, Math.floor(maxTokens / 4));
+  const limitedEditor = editorContext ? limitTokensFromEnd(editorContext, editorTokenBudget) : "";
+  const fixedTokens = estimateTokens(
+    [
+      "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
+      limitedEditor || "(empty)",
+      sessionHeader,
+    ].join("\n\n"),
+  );
+  const sessionBudget = Math.max(0, maxTokens - fixedTokens);
+  return {
+    editorContext: limitedEditor,
+    sessionContext: sessionContext ? limitTokensFromEnd(sessionContext, sessionBudget) : "",
+  };
+}
+
+function commandOutputInDir(cwd: string, command: string, args: string[], timeoutMs = 2500): string {
+  const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 1024 * 1024 * 8 });
+  if (result.status !== 0) return "";
+  return (result.stdout || "").trim();
+}
+
+function findGitRoot(startDir: string): string | null {
+  const root = commandOutputInDir(startDir, "git", ["rev-parse", "--show-toplevel"], 1500);
+  return root || null;
+}
+
+function buildGitContext(cwd: string): string {
+  const gitRoot = findGitRoot(cwd);
+  if (!gitRoot) return "(not a git repository)";
+
+  const recentLog = commandOutputInDir(
+    gitRoot,
+    "git",
+    ["log", `-${POSTPROCESS_GIT_LOG_LIMIT}`, "--date=short", "--pretty=format:%h %ad %an %s"],
+    2500,
+  );
+
+  return [
+    `Repository root: ${gitRoot}`,
+    `Recent commits (up to ${POSTPROCESS_GIT_LOG_LIMIT}):`,
+    recentLog ? redactSensitiveText(recentLog) : "(no commits yet)",
+  ].join("\n");
+}
+
+function shouldSkipDirectoryEntry(name: string): boolean {
+  return SKIPPED_DIRECTORY_ENTRIES.has(name);
+}
+
+function safeReadDir(dir: string): string[] {
+  try {
+    return readdirSync(dir).sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+
+function formatDirectoryEntry(fullPath: string, name: string, isCwd = false): string {
+  try {
+    const stat = lstatSync(fullPath);
+    const suffix = stat.isDirectory() ? "/" : stat.isSymbolicLink() ? "@" : "";
+    return `${name}${suffix}${isCwd ? "  <-- current" : ""}`;
+  } catch {
+    return `${name}${isCwd ? "  <-- current" : ""}`;
+  }
+}
+
+function buildTreeLines(dir: string, depth: number, prefix = "", state = { entries: 0, omitted: 0 }): string[] {
+  if (depth < 0) return [];
+  const names = safeReadDir(dir).filter((name) => !shouldSkipDirectoryEntry(name));
+  const visibleNames = names.slice(0, 120);
+  state.omitted += Math.max(0, names.length - visibleNames.length);
+  const lines: string[] = [];
+
+  visibleNames.forEach((name, index) => {
+    const fullPath = path.join(dir, name);
+    const isLast = index === visibleNames.length - 1;
+    const connector = isLast ? "└── " : "├── ";
+    const childPrefix = `${prefix}${isLast ? "    " : "│   "}`;
+    const label = formatDirectoryEntry(fullPath, name);
+    lines.push(`${prefix}${connector}${label}`);
+    state.entries += 1;
+
+    try {
+      const stat = lstatSync(fullPath);
+      if (stat.isDirectory() && !stat.isSymbolicLink() && depth > 0) {
+        lines.push(...buildTreeLines(fullPath, depth - 1, childPrefix, state));
+      }
+    } catch {
+      // ignore unreadable entries
+    }
+  });
+
+  return lines;
+}
+
+function buildDirectoryContext(cwd: string, maxTokens: number): string {
+  if (maxTokens <= 0) return "";
+  const parent = path.dirname(cwd);
+  const isRootDirectory = path.resolve(parent) === path.resolve(cwd);
+  const cwdName = path.basename(cwd) || cwd;
+  const parentEntries = isRootDirectory
+    ? []
+    : safeReadDir(parent)
+        .filter((name) => !shouldSkipDirectoryEntry(name))
+        .slice(0, 160)
+        .map((name) => formatDirectoryEntry(path.join(parent, name), name, path.resolve(parent, name) === path.resolve(cwd)));
+  const state = { entries: 0, omitted: 0 };
+  const cwdTree = buildTreeLines(cwd, POSTPROCESS_DIRECTORY_DEPTH - 1, "", state);
+  const text = [
+    `Current directory: ${cwd}`,
+    isRootDirectory ? "Parent directory: (current directory is filesystem root; no parent directory)" : `Parent directory: ${parent}`,
+    "Parent entries (one level up):",
+    isRootDirectory ? "- (none; current directory is filesystem root)" : parentEntries.length ? parentEntries.map((entry) => `- ${entry}`).join("\n") : "- (empty or unreadable)",
+    "",
+    `Current directory tree (${cwdName}/, ${POSTPROCESS_DIRECTORY_DEPTH} levels deep):`,
+    `${cwdName}/`,
+    cwdTree.length ? cwdTree.join("\n") : "└── (empty or no readable child entries)",
+    state.omitted > 0 ? `…(${state.omitted} entries omitted)` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return limitTokensFromStart(text, maxTokens);
 }
 
 function simplifyModelReference(value: string): string {
@@ -1091,44 +1308,20 @@ function cleanPostprocessOutput(output: string): string {
   return text;
 }
 
-const EXPLICIT_ENGLISH_MULTILINE_PATTERN =
-  /\b(?:new\s*line|newline|line break|next line|new paragraph|paragraph break|carriage return|press enter|separate lines?|multi[- ]line|multiple lines)\b/i;
-const EXPLICIT_CHINESE_MULTILINE_PATTERN = /(?:换行|新的一行|另起一行|下一行|回车|分行|多行|逐行|每行|空一行|新段落|另起一段|分段)/u;
-const CJK_LIKE_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const CJK_PUNCTUATION_PATTERN = /[，。！？、；：（）《》「」『』“”‘’]/u;
-const CLOSING_PUNCTUATION_PATTERN = /^[,.;:!?，。！？、；：）)\]}》」』”’]/u;
-const OPENING_PUNCTUATION_PATTERN = /[（([{\[《「『“‘]$/u;
-
 function rawTextRequestsMultiline(rawText: string): boolean {
-  // Existing newlines in raw ASR are not reliable user intent: providers can
-  // insert segment or sentence breaks on their own. Treat only spoken layout
-  // commands as intentional multiline input.
-  return EXPLICIT_ENGLISH_MULTILINE_PATTERN.test(rawText) || EXPLICIT_CHINESE_MULTILINE_PATTERN.test(rawText);
-}
-
-function lineBreakJoiner(left: string, right: string): string {
-  if (!left || !right) return "";
-  if (CLOSING_PUNCTUATION_PATTERN.test(right) || OPENING_PUNCTUATION_PATTERN.test(left)) return "";
-  if (CJK_PUNCTUATION_PATTERN.test(left) || CJK_PUNCTUATION_PATTERN.test(right)) return "";
-  if (CJK_LIKE_PATTERN.test(left) && CJK_LIKE_PATTERN.test(right)) return "";
-  return " ";
+  return (
+    /\r|\n/.test(rawText) ||
+    /\b(?:new\s*line|newline|line break|next line|new paragraph|paragraph break|carriage return|press enter|separate lines?|multi[- ]line|multiple lines)\b/i.test(rawText) ||
+    /(?:换行|新的一行|另起一行|下一行|回车|分行|多行|逐行|每行|空一行|新段落|另起一段|分段)/u.test(rawText)
+  );
 }
 
 function collapseUnexpectedLineBreaks(text: string): string {
-  const normalized = text.replace(/\r\n?/g, "\n");
-  return normalized
-    .replace(/[ \t\f\v]*\n+[ \t\f\v]*/g, (match, offset: number, source: string) => {
-      const left = source.slice(0, offset).replace(/[ \t\f\v]+$/g, "").at(-1) ?? "";
-      const right = source.slice(offset + match.length).replace(/^[ \t\f\v]+/g, "").at(0) ?? "";
-      return lineBreakJoiner(left, right);
-    })
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]*\n+[ \t\f\v]*/g, " ")
     .replace(/[ \t\f\v]{2,}/g, " ")
     .trim();
-}
-
-function normalizeRawTextForPostprocess(rawText: string): string {
-  const raw = rawText.trim();
-  return rawTextRequestsMultiline(raw) ? raw : collapseUnexpectedLineBreaks(raw);
 }
 
 function preserveExpectedPostprocessLayout(rawText: string, output: string): string {
@@ -1169,9 +1362,10 @@ function getFullEditorText(ctx: ExtensionContext): string {
 }
 
 function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: VoiceConfig): string {
-  const contextBudget = config.postprocessContextChars;
-  const editorContext = getEditorContext(ctx, Math.floor(contextBudget / 2));
-  const sessionContext = getRecentSessionContext(ctx, Math.ceil(contextBudget / 2));
+  const { editorContext, sessionContext } = buildConversationContext(ctx, config.postprocessContextTokens);
+  const cwd = process.cwd();
+  const gitContext = buildGitContext(cwd);
+  const directoryContext = buildDirectoryContext(cwd, POSTPROCESS_DIRECTORY_TOKENS);
 
   return [
     "Polish only the raw ASR text below, using context only when it helps disambiguate the user's intent.",
@@ -1184,14 +1378,21 @@ function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: 
     "The true cursor position is not marked in the draft shown here; the pi editor owns the actual insertion point. Do not guess the cursor and synthesize a full surrounding sentence.",
     "Preserve layout: if the raw ASR text is one line, output one line unless the user explicitly dictated line breaks or another multiline layout.",
     "If the raw speech is an inline insertion, continuation, a few words, or a phrase, output only the newly spoken words or phrase.",
+    "Use the git history and directory structure only as reference context for project names, files, APIs, and intent; never summarize them in the output.",
     "Example: draft is `Please make this function async and [cursor].`, raw speech is `add error handling`, correct output is `add error handling`, not `Please make this function async and add error handling.`.",
     "Example: draft is `This variable name is [cursor]unclear`, raw speech is `still`, correct output is `still`, not `This variable name is still unclear`.",
     "",
     "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
-    editorContext.trim() || "(empty)",
+    editorContext || "(empty)",
     "",
-    "--- Context: recent conversation ---",
+    "--- Context: recent conversation (recent tail, capped at 20k estimated tokens with the editor draft) ---",
     sessionContext || "(empty)",
+    "",
+    "--- Context: git history (latest commit summaries only) ---",
+    gitContext || "(empty)",
+    "",
+    "--- Context: directory structure (parent one level; current directory two levels deep) ---",
+    directoryContext || "(empty)",
     "",
     "--- Raw ASR text ---",
     rawText.trim(),
@@ -1217,7 +1418,7 @@ async function postprocessTranscript(ctx: ExtensionContext, rawText: string, con
       messages: [
         {
           role: "user",
-          content: buildPostprocessPrompt(ctx, normalizeRawTextForPostprocess(raw), config),
+          content: buildPostprocessPrompt(ctx, raw, config),
           timestamp: Date.now(),
         },
       ],
@@ -1394,7 +1595,6 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
 
   let finalText = result.text;
   let postprocessMs = 0;
-  let postprocessSucceeded = false;
   let postprocessUsed = false;
   if (config.postprocessEnabled) {
     ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● polishing"));
@@ -1402,7 +1602,7 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
     try {
       finalText = await postprocessTranscript(ctx, result.text, config);
       postprocessMs = Date.now() - postprocessStart;
-      postprocessSucceeded = true;
+      postprocessUsed = finalText.trim() !== result.text.trim();
     } catch (error) {
       postprocessMs = Date.now() - postprocessStart;
       ctx.ui.notify(
@@ -1411,9 +1611,6 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
       );
     }
   }
-
-  finalText = preserveExpectedPostprocessLayout(result.text, finalText);
-  postprocessUsed = postprocessSucceeded && finalText.trim() !== result.text.trim();
 
   ctx.ui.setStatus("voice-input", undefined);
   insertIntoEditor(ctx, finalText);
