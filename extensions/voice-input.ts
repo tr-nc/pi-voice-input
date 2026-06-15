@@ -23,6 +23,10 @@ import WebSocket from "ws";
 
 const CONFIG_PATH = path.join(homedir(), ".pi", "agent", "voice-input.config.json");
 const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default";
+// pi-bridge redirects child_process calls whose cwd is inside the bridged fake
+// project directory. Audio capture and system volume control must always use
+// the local machine, so force those subprocesses to a known-local cwd.
+const LOCAL_AUDIO_PROCESS_CWD = homedir();
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
 const DEFAULT_POSTPROCESS_MODEL = "";
 const DEFAULT_POSTPROCESS_CONTEXT_TOKENS = 20000;
@@ -267,17 +271,17 @@ function timestampForFilename(): string {
 }
 
 function commandExists(command: string): boolean {
-  return spawnSync("sh", ["-lc", `command -v ${command}`], { stdio: "ignore" }).status === 0;
+  return spawnSync("sh", ["-lc", `command -v ${command}`], { cwd: LOCAL_AUDIO_PROCESS_CWD, stdio: "ignore" }).status === 0;
 }
 
 function commandOutput(command: string, args: string[], timeoutMs = 1500): string {
-  const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs });
+  const result = spawnSync(command, args, { cwd: LOCAL_AUDIO_PROCESS_CWD, encoding: "utf8", timeout: timeoutMs });
   if (result.status !== 0) return "";
   return (result.stdout || "").trim();
 }
 
 function runCommand(command: string, args: string[], timeoutMs = 1500): boolean {
-  return spawnSync(command, args, { stdio: "ignore", timeout: timeoutMs }).status === 0;
+  return spawnSync(command, args, { cwd: LOCAL_AUDIO_PROCESS_CWD, stdio: "ignore", timeout: timeoutMs }).status === 0;
 }
 
 function formatPercent(value: number): string {
@@ -1527,6 +1531,7 @@ async function startRecording(ctx: ExtensionContext) {
   let child: ReturnType<typeof spawn>;
   try {
     child = spawn(cmd[0], cmd.slice(1), {
+      cwd: LOCAL_AUDIO_PROCESS_CWD,
       detached: true,
       stdio: ["ignore", "ignore", "ignore"],
     });
