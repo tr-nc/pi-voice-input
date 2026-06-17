@@ -11,7 +11,7 @@ Typing long prompts can slow you down. `pi-voice-input` lets you:
 - speak naturally in Chinese, English, or a mix of both
 - keep your hands on the keyboard with a simple toggle shortcut
 - review or edit the inserted text before you submit it
-- optionally polish dictated text with one of your configured pi models
+- pass the raw transcript to the model with an explicit voice-input caveat
 
 ## Features
 
@@ -20,7 +20,7 @@ Typing long prompts can slow you down. `pi-voice-input` lets you:
 - **Chinese/English mixed input**: handles prompts that switch between Chinese, English, product names, and technical terms.
 - **Works on Linux and macOS**: uses common system recording tools.
 - **Lowers sound while you speak**: automatically turns down system audio during recording, then restores it afterwards.
-- **Optional transcript polish**: use a pi model to clean up punctuation and wording before insertion.
+- **No hidden rewriting**: inserts the raw ASR transcript, prefixed with a short note that it may contain voice-recognition errors.
 - **Simple setup commands**: configure from inside pi with `/voice init` and `/voice key`.
 
 Current speech provider: **VolcEngine Speech ASR**. A VolcEngine Speech API key is required.
@@ -96,30 +96,20 @@ Useful commands:
 /voice help     show setup help
 ```
 
-## Optional: polish dictated text
+## Inserted text format
 
-By default, pi inserts the raw transcript. To let a pi model clean up punctuation and wording, set `polishModel` in:
+The extension does not call a model to modify or translate your transcript. It inserts a short caveat telling the downstream model that the following text came from voice input and may contain recognition errors, then appends the raw ASR transcript unchanged.
 
-```text
-~/.pi/agent/voice-input.config.json
-```
-
-Use any model name shown by:
-
-```bash
-pi --list-models
-```
-
-Example:
+User config keys are:
 
 ```json
 {
   "volcApiKey": "",
-  "polishModel": "your-model-name"
+  "duckSystemVolume": true,
+  "duckSystemVolumeFactor": 0.5,
+  "duckSystemVolumeFadeMs": 300
 }
 ```
-
-If polishing fails, the raw transcript is inserted instead.
 
 ## System requirements
 

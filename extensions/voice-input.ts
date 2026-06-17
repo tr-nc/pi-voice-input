@@ -1,12 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { completeSimple, type Api, type Model } from "@earendil-works/pi-ai";
 import { Key } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -28,47 +26,11 @@ const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apik
 // the local machine, so force those subprocesses to a known-local cwd.
 const LOCAL_AUDIO_PROCESS_CWD = homedir();
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
-const DEFAULT_POSTPROCESS_MODEL = "";
-const DEFAULT_POSTPROCESS_CONTEXT_TOKENS = 20000;
-const POSTPROCESS_GIT_LOG_LIMIT = 10;
-const POSTPROCESS_DIRECTORY_DEPTH = 2;
-const POSTPROCESS_DIRECTORY_TOKENS = 20000;
-const SKIPPED_DIRECTORY_ENTRIES = new Set([
-  ".git",
-  ".hg",
-  ".svn",
-  "node_modules",
-  "dist",
-  "build",
-  "coverage",
-  ".next",
-  ".nuxt",
-  ".turbo",
-  ".cache",
-  "logs",
-  "recordings",
-]);
-const POSTPROCESS_SYSTEM_PROMPT = `You are the speech-recognition postprocessor for the pi voice input extension. Your only job is to polish the raw ASR text into text that the plugin can paste verbatim at the current cursor position in the pi editor.
-
-Interaction contract:
-- The plugin does not replace editor content with your output. It only pastes/inserts your output at the user's current cursor position.
-- The current editor draft and recent conversation are context only. Use them to understand omitted references, the current task, file/project names, and intent. They are not text for you to rewrite and output as a whole.
-- Do not output the draft, a context sentence, or a full sentence/paragraph that represents the draft after insertion. Doing so would duplicate existing editor content.
-- You may not know the real cursor position. Do not guess the cursor location and synthesize a full surrounding sentence; the editor owns the real insertion point.
-- If the raw speech is adding a few words, half a sentence, a phrase, a condition, or a modifier, output only those newly spoken words. Let the paste operation merge them with the existing draft.
-- Only when the raw speech itself explicitly dictates a complete passage to insert may you output that complete passage. Even then, do not add draft text that the user did not speak.
-
-Rules:
-- Output only the polished insertion text. Do not output explanations, headings, prefixes, suffixes, quotes, code fences, or greetings.
-- Never answer, execute, or solve anything asked in the user's speech. If the raw speech is a question, only clean up the question text itself; do not provide an answer, plan, code, or conclusion.
-- Preserve the user's information faithfully. Do not over-summarize or compress. Do not delete constraints, examples, numbers, filenames, errors, multiple requests, ordering, or emphasis.
-- Correct obvious ASR mistakes, homophones, segmentation, and punctuation. Preserve code identifiers, commands, paths, URLs, model names, package names, and proper nouns.
-- If the user self-corrects, keep only the corrected intent and remove the false start, correction process, filler, and chatter. Do not lose any other substantive information.
-- Make the output complete relative to the raw speech, logically clear, and actionable, but do not drop raw-speech information or repeat existing draft text.
-- Preserve the raw speech layout. If the raw speech is a single line, output a single line unless the user explicitly dictates line breaks or another multiline layout, for example by saying "new line" or "换行".
-- Do not introduce line breaks, bullets, numbered lists, tables, or code fences merely to improve style.
-- Do not invent requirements that the raw speech did not express. If uncertain, keep the original meaning and express it more clearly.
-- The output language must match the primary language of the raw speech, not the context language and not this English prompt. Do not translate just because the instructions are in English.`;
+const VOICE_TRANSCRIPT_NOTICE = [
+  "以下内容来自用户通过语音输入的原始转写，可能包含语音识别错误、错别字、同音词、断句或标点不准确，以及中英文、术语、代码名、文件名误识别等问题。",
+  "请明确注意：这段转写不一定完全准确。请结合上下文理解用户意图；必要时可以先澄清、翻译或推断，再继续处理。",
+  "原始语音转写如下：",
+].join("\n");
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
 const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
@@ -84,7 +46,6 @@ type JsonObject = Record<string, unknown>;
 
 type VoiceInputConfigFile = {
   volcApiKey: string;
-  polishModel: string;
   duckSystemVolume: boolean;
   duckSystemVolumeFactor: number;
   duckSystemVolumeFadeMs: number;
@@ -108,11 +69,6 @@ type VoiceConfig = {
   enablePunc: boolean;
   enableDdc: boolean;
   showUtterances: boolean;
-  postprocessEnabled: boolean;
-  postprocessModel: string;
-  postprocessTimeoutMs: number;
-  postprocessMaxTokens: number;
-  postprocessContextTokens: number;
   duckSystemVolume: boolean;
   duckSystemVolumeFactor: number;
   duckSystemVolumeFadeMs: number;
@@ -162,7 +118,6 @@ function ensureDir(dir: string) {
 function defaultConfigFile(): VoiceInputConfigFile {
   return {
     volcApiKey: "",
-    polishModel: DEFAULT_POSTPROCESS_MODEL,
     duckSystemVolume: true,
     duckSystemVolumeFactor: 0.5,
     duckSystemVolumeFadeMs: 300,
@@ -197,7 +152,6 @@ function normalizeConfigFile(input: unknown): VoiceInputConfigFile {
   const root = isObject(input) ? input : {};
   return {
     volcApiKey: stringField(root, "volcApiKey", defaults.volcApiKey).trim(),
-    polishModel: stringField(root, "polishModel", defaults.polishModel).trim(),
     duckSystemVolume: booleanField(root, "duckSystemVolume", defaults.duckSystemVolume),
     duckSystemVolumeFactor: clamp(numberField(root, "duckSystemVolumeFactor", defaults.duckSystemVolumeFactor), 0, 1),
     duckSystemVolumeFadeMs: Math.round(clamp(numberField(root, "duckSystemVolumeFadeMs", defaults.duckSystemVolumeFadeMs), 0, 3000)),
@@ -222,7 +176,6 @@ function loadConfigFile(): VoiceInputConfigFile {
 function getConfig(): VoiceConfig {
   const fileConfig = loadConfigFile();
   const voiceHome = path.join(homedir(), ".pi", "agent", "voice-input");
-  const polishModel = fileConfig.polishModel.trim();
 
   return {
     configPath: CONFIG_PATH,
@@ -242,11 +195,6 @@ function getConfig(): VoiceConfig {
     enablePunc: true,
     enableDdc: false,
     showUtterances: false,
-    postprocessEnabled: polishModel.length > 0,
-    postprocessModel: polishModel,
-    postprocessTimeoutMs: 30000,
-    postprocessMaxTokens: 2048,
-    postprocessContextTokens: DEFAULT_POSTPROCESS_CONTEXT_TOKENS,
     duckSystemVolume: fileConfig.duckSystemVolume,
     duckSystemVolumeFactor: fileConfig.duckSystemVolumeFactor,
     duckSystemVolumeFadeMs: fileConfig.duckSystemVolumeFadeMs,
@@ -980,498 +928,12 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
   };
 }
 
-function estimateTokens(text: string): number {
-  let tokens = 0;
-  let asciiRun = 0;
-  const flushAscii = () => {
-    if (asciiRun > 0) {
-      tokens += Math.ceil(asciiRun / 4);
-      asciiRun = 0;
-    }
-  };
+function wrapVoiceTranscript(rawText: string): string {
+  const trimmed = rawText.trim();
+  if (!trimmed) return "";
+  return `${VOICE_TRANSCRIPT_NOTICE}
 
-  for (const char of text) {
-    if (/\s/u.test(char)) {
-      flushAscii();
-    } else if (/[^\x00-\x7F]/u.test(char)) {
-      flushAscii();
-      tokens += 1;
-    } else {
-      asciiRun += 1;
-    }
-  }
-  flushAscii();
-  return tokens;
-}
-
-function takeTokensFromStart(text: string, maxTokens: number): string {
-  if (maxTokens <= 0 || !text) return "";
-  if (estimateTokens(text) <= maxTokens) return text;
-
-  let low = 0;
-  let high = text.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (estimateTokens(text.slice(0, mid)) <= maxTokens) low = mid;
-    else high = mid - 1;
-  }
-  return text.slice(0, low);
-}
-
-function takeTokensFromEnd(text: string, maxTokens: number): string {
-  if (maxTokens <= 0 || !text) return "";
-  if (estimateTokens(text) <= maxTokens) return text;
-
-  let low = 0;
-  let high = text.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (estimateTokens(text.slice(text.length - mid)) <= maxTokens) low = mid;
-    else high = mid - 1;
-  }
-  return text.slice(text.length - low);
-}
-
-function limitTokensFromStart(text: string, maxTokens: number, marker = "\n…(truncated to fit token budget)"): string {
-  if (maxTokens <= 0) return "";
-  if (estimateTokens(text) <= maxTokens) return text;
-  const markerTokens = estimateTokens(marker);
-  return `${takeTokensFromStart(text, Math.max(0, maxTokens - markerTokens)).trimEnd()}${marker}`;
-}
-
-function limitTokensFromEnd(text: string, maxTokens: number, marker = "…(older context omitted to fit token budget)\n"): string {
-  if (maxTokens <= 0) return "";
-  if (estimateTokens(text) <= maxTokens) return text;
-  const markerTokens = estimateTokens(marker);
-  return `${marker}${takeTokensFromEnd(text, Math.max(0, maxTokens - markerTokens)).trimStart()}`;
-}
-
-function redactSensitiveText(text: string): string {
-  return text
-    .replace(/(\bVOLC_API_KEY\s*=\s*)[^\s"']+/giu, "$1[redacted]")
-    .replace(/((?:\b|["'])(?:volcApiKey|api[_-]?key|apikey|access[_-]?token|secret|password)(?:\b|["'])\s*[:=]\s*["']?)[^"'\s,}]+/giu, "$1[redacted]")
-    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu, "[redacted-uuid]");
-}
-
-function textFromContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => {
-      if (!part || typeof part !== "object") return "";
-      const block = part as { type?: unknown; text?: unknown };
-      if (block.type === "text" && typeof block.text === "string") return block.text;
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function getEditorContext(ctx: ExtensionContext): string {
-  try {
-    return redactSensitiveText(ctx.ui.getEditorText()).trim();
-  } catch {
-    return "";
-  }
-}
-
-function getRecentSessionContext(ctx: ExtensionContext): string {
-  const lines: string[] = [];
-  for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type !== "message") continue;
-    const message = entry.message as { role?: unknown; content?: unknown };
-    if (message.role !== "user" && message.role !== "assistant") continue;
-    const text = redactSensitiveText(textFromContent(message.content)).trim();
-    if (!text) continue;
-    lines.push(`${message.role}: ${text}`);
-  }
-  return lines.join("\n\n");
-}
-
-function buildConversationContext(ctx: ExtensionContext, maxTokens: number): { editorContext: string; sessionContext: string } {
-  if (maxTokens <= 0) return { editorContext: "", sessionContext: "" };
-
-  const editorContext = getEditorContext(ctx);
-  const sessionContext = getRecentSessionContext(ctx);
-  const editorSection = [
-    "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
-    editorContext || "(empty)",
-  ].join("\n");
-  const sessionHeader = "--- Context: recent conversation ---\n";
-  const totalTokens = estimateTokens([editorSection, sessionHeader, sessionContext || "(empty)"].join("\n\n"));
-  if (totalTokens <= maxTokens) return { editorContext, sessionContext };
-
-  const editorTokenBudget = Math.min(5000, Math.floor(maxTokens / 4));
-  const limitedEditor = editorContext ? limitTokensFromEnd(editorContext, editorTokenBudget) : "";
-  const fixedTokens = estimateTokens(
-    [
-      "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
-      limitedEditor || "(empty)",
-      sessionHeader,
-    ].join("\n\n"),
-  );
-  const sessionBudget = Math.max(0, maxTokens - fixedTokens);
-  return {
-    editorContext: limitedEditor,
-    sessionContext: sessionContext ? limitTokensFromEnd(sessionContext, sessionBudget) : "",
-  };
-}
-
-function commandOutputInDir(cwd: string, command: string, args: string[], timeoutMs = 2500): string {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 1024 * 1024 * 8 });
-  if (result.status !== 0) return "";
-  return (result.stdout || "").trim();
-}
-
-function findGitRoot(startDir: string): string | null {
-  const root = commandOutputInDir(startDir, "git", ["rev-parse", "--show-toplevel"], 1500);
-  return root || null;
-}
-
-function buildGitContext(cwd: string): string {
-  const gitRoot = findGitRoot(cwd);
-  if (!gitRoot) return "(not a git repository)";
-
-  const recentLog = commandOutputInDir(
-    gitRoot,
-    "git",
-    ["log", `-${POSTPROCESS_GIT_LOG_LIMIT}`, "--date=short", "--pretty=format:%h %ad %an %s"],
-    2500,
-  );
-
-  return [
-    `Repository root: ${gitRoot}`,
-    `Recent commits (up to ${POSTPROCESS_GIT_LOG_LIMIT}):`,
-    recentLog ? redactSensitiveText(recentLog) : "(no commits yet)",
-  ].join("\n");
-}
-
-function shouldSkipDirectoryEntry(name: string): boolean {
-  return SKIPPED_DIRECTORY_ENTRIES.has(name);
-}
-
-function safeReadDir(dir: string): string[] {
-  try {
-    return readdirSync(dir).sort((a, b) => a.localeCompare(b));
-  } catch {
-    return [];
-  }
-}
-
-function formatDirectoryEntry(fullPath: string, name: string, isCwd = false): string {
-  try {
-    const stat = lstatSync(fullPath);
-    const suffix = stat.isDirectory() ? "/" : stat.isSymbolicLink() ? "@" : "";
-    return `${name}${suffix}${isCwd ? "  <-- current" : ""}`;
-  } catch {
-    return `${name}${isCwd ? "  <-- current" : ""}`;
-  }
-}
-
-function buildTreeLines(dir: string, depth: number, prefix = "", state = { entries: 0, omitted: 0 }): string[] {
-  if (depth < 0) return [];
-  const names = safeReadDir(dir).filter((name) => !shouldSkipDirectoryEntry(name));
-  const visibleNames = names.slice(0, 120);
-  state.omitted += Math.max(0, names.length - visibleNames.length);
-  const lines: string[] = [];
-
-  visibleNames.forEach((name, index) => {
-    const fullPath = path.join(dir, name);
-    const isLast = index === visibleNames.length - 1;
-    const connector = isLast ? "└── " : "├── ";
-    const childPrefix = `${prefix}${isLast ? "    " : "│   "}`;
-    const label = formatDirectoryEntry(fullPath, name);
-    lines.push(`${prefix}${connector}${label}`);
-    state.entries += 1;
-
-    try {
-      const stat = lstatSync(fullPath);
-      if (stat.isDirectory() && !stat.isSymbolicLink() && depth > 0) {
-        lines.push(...buildTreeLines(fullPath, depth - 1, childPrefix, state));
-      }
-    } catch {
-      // ignore unreadable entries
-    }
-  });
-
-  return lines;
-}
-
-function buildDirectoryContext(cwd: string, maxTokens: number): string {
-  if (maxTokens <= 0) return "";
-  const parent = path.dirname(cwd);
-  const isRootDirectory = path.resolve(parent) === path.resolve(cwd);
-  const cwdName = path.basename(cwd) || cwd;
-  const parentEntries = isRootDirectory
-    ? []
-    : safeReadDir(parent)
-        .filter((name) => !shouldSkipDirectoryEntry(name))
-        .slice(0, 160)
-        .map((name) => formatDirectoryEntry(path.join(parent, name), name, path.resolve(parent, name) === path.resolve(cwd)));
-  const state = { entries: 0, omitted: 0 };
-  const cwdTree = buildTreeLines(cwd, POSTPROCESS_DIRECTORY_DEPTH - 1, "", state);
-  const text = [
-    `Current directory: ${cwd}`,
-    isRootDirectory ? "Parent directory: (current directory is filesystem root; no parent directory)" : `Parent directory: ${parent}`,
-    "Parent entries (one level up):",
-    isRootDirectory ? "- (none; current directory is filesystem root)" : parentEntries.length ? parentEntries.map((entry) => `- ${entry}`).join("\n") : "- (empty or unreadable)",
-    "",
-    `Current directory tree (${cwdName}/, ${POSTPROCESS_DIRECTORY_DEPTH} levels deep):`,
-    `${cwdName}/`,
-    cwdTree.length ? cwdTree.join("\n") : "└── (empty or no readable child entries)",
-    state.omitted > 0 ? `…(${state.omitted} entries omitted)` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-  return limitTokensFromStart(text, maxTokens);
-}
-
-function simplifyModelReference(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-function stripThinkingSuffix(value: string): string {
-  return value.replace(/:(?:off|minimal|low|medium|high|xhigh)$/i, "");
-}
-
-function modelLabel(model: Model<Api>): string {
-  return `${model.provider}/${model.id}`;
-}
-
-function resolvePostprocessModel(ctx: ExtensionContext, reference: string): Model<Api> {
-  const requested = stripThinkingSuffix(reference.trim());
-  if (!requested) throw new Error("polishModel is empty in voice input config");
-
-  const models = ctx.modelRegistry.getAll();
-  const lower = requested.toLowerCase();
-  const simple = simplifyModelReference(requested);
-
-  const exactCanonical = models.filter((model) => modelLabel(model).toLowerCase() === lower);
-  if (exactCanonical.length === 1) return exactCanonical[0];
-
-  const exactBare = models.filter((model) => model.id.toLowerCase() === lower || model.name.toLowerCase() === lower);
-  if (exactBare.length === 1) return exactBare[0];
-  if (exactBare.length > 1) {
-    throw new Error(
-      `Ambiguous postprocess model "${reference}". Use provider/model, e.g. ${exactBare.map(modelLabel).slice(0, 5).join(", ")}`,
-    );
-  }
-
-  const exactSimple = models.filter(
-    (model) =>
-      simplifyModelReference(modelLabel(model)) === simple ||
-      simplifyModelReference(model.id) === simple ||
-      simplifyModelReference(model.name) === simple,
-  );
-  if (exactSimple.length === 1) return exactSimple[0];
-  if (exactSimple.length > 1) {
-    throw new Error(
-      `Ambiguous postprocess model "${reference}". Use provider/model, e.g. ${exactSimple.map(modelLabel).slice(0, 5).join(", ")}`,
-    );
-  }
-
-  const fuzzy = models.filter(
-    (model) =>
-      modelLabel(model).toLowerCase().includes(lower) ||
-      model.id.toLowerCase().includes(lower) ||
-      model.name.toLowerCase().includes(lower) ||
-      simplifyModelReference(modelLabel(model)).includes(simple) ||
-      simplifyModelReference(model.id).includes(simple) ||
-      simplifyModelReference(model.name).includes(simple),
-  );
-  if (fuzzy.length === 1) return fuzzy[0];
-  if (fuzzy.length > 1) {
-    throw new Error(
-      `Ambiguous postprocess model "${reference}". Use provider/model, e.g. ${fuzzy.map(modelLabel).slice(0, 5).join(", ")}`,
-    );
-  }
-
-  throw new Error(`Postprocess model "${reference}" not found. Run pi --list-models to see available models.`);
-}
-
-function extractAssistantText(message: { content: unknown }): string {
-  const content = message.content;
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => {
-      if (!part || typeof part !== "object") return "";
-      const block = part as { type?: unknown; text?: unknown };
-      if (block.type === "text" && typeof block.text === "string") return block.text;
-      return "";
-    })
-    .join("")
-    .trim();
-}
-
-function cleanPostprocessOutput(output: string): string {
-  let text = output.trim();
-  const fence = text.match(/^```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n```$/);
-  if (fence) text = fence[1].trim();
-  text = text.replace(/^(?:polished(?: user)? instruction|refined(?: user)? instruction|rewritten(?: user)? instruction|final(?: insertion)? text)\s*:\s*/iu, "").trim();
-  return text;
-}
-
-const EXPLICIT_ENGLISH_MULTILINE_PATTERN =
-  /\b(?:new\s*line|newline|line break|next line|new paragraph|paragraph break|carriage return|press enter|separate lines?|multi[- ]line|multiple lines)\b/i;
-const EXPLICIT_CHINESE_MULTILINE_PATTERN = /(?:换行|新的一行|另起一行|下一行|回车|分行|多行|逐行|每行|空一行|新段落|另起一段|分段)/u;
-const CJK_LIKE_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const CJK_PUNCTUATION_PATTERN = /[，。！？、；：（）《》「」『』“”‘’]/u;
-const CLOSING_PUNCTUATION_PATTERN = /^[,.;:!?，。！？、；：）)\]}》」』”’]/u;
-const OPENING_PUNCTUATION_PATTERN = /[（([{\[《「『“‘]$/u;
-
-function rawTextRequestsMultiline(rawText: string): boolean {
-  // Existing newlines in raw ASR are not reliable user intent: providers can
-  // insert segment or sentence breaks on their own. Treat only spoken layout
-  // commands as intentional multiline input.
-  return EXPLICIT_ENGLISH_MULTILINE_PATTERN.test(rawText) || EXPLICIT_CHINESE_MULTILINE_PATTERN.test(rawText);
-}
-
-function lineBreakJoiner(left: string, right: string): string {
-  if (!left || !right) return "";
-  if (CLOSING_PUNCTUATION_PATTERN.test(right) || OPENING_PUNCTUATION_PATTERN.test(left)) return "";
-  if (CJK_PUNCTUATION_PATTERN.test(left) || CJK_PUNCTUATION_PATTERN.test(right)) return "";
-  if (CJK_LIKE_PATTERN.test(left) && CJK_LIKE_PATTERN.test(right)) return "";
-  return " ";
-}
-
-function collapseUnexpectedLineBreaks(text: string): string {
-  const normalized = text.replace(/\r\n?/g, "\n");
-  return normalized
-    .replace(/[ \t\f\v]*\n+[ \t\f\v]*/g, (match, offset: number, source: string) => {
-      const left = source.slice(0, offset).replace(/[ \t\f\v]+$/g, "").at(-1) ?? "";
-      const right = source.slice(offset + match.length).replace(/^[ \t\f\v]+/g, "").at(0) ?? "";
-      return lineBreakJoiner(left, right);
-    })
-    .replace(/[ \t\f\v]{2,}/g, " ")
-    .trim();
-}
-
-function normalizeRawTextForPostprocess(rawText: string): string {
-  const raw = rawText.trim();
-  return rawTextRequestsMultiline(raw) ? raw : collapseUnexpectedLineBreaks(raw);
-}
-
-function preserveExpectedPostprocessLayout(rawText: string, output: string): string {
-  if (rawTextRequestsMultiline(rawText)) return output.trim();
-  return collapseUnexpectedLineBreaks(output);
-}
-
-function removeEditorDraftEcho(editorText: string, output: string): string {
-  const draft = editorText.trim();
-  const text = output.trim();
-  if (draft.length < 12 || text.length <= draft.length) return output;
-
-  let prefixLength = 0;
-  while (prefixLength < draft.length && prefixLength < text.length && draft[prefixLength] === text[prefixLength]) {
-    prefixLength += 1;
-  }
-
-  let suffixLength = 0;
-  while (
-    suffixLength < draft.length - prefixLength &&
-    suffixLength < text.length - prefixLength &&
-    draft[draft.length - 1 - suffixLength] === text[text.length - 1 - suffixLength]
-  ) {
-    suffixLength += 1;
-  }
-
-  if (prefixLength + suffixLength !== draft.length) return output;
-  const insertedText = text.slice(prefixLength, text.length - suffixLength).trim();
-  return insertedText || output;
-}
-
-function getFullEditorText(ctx: ExtensionContext): string {
-  try {
-    return ctx.ui.getEditorText();
-  } catch {
-    return "";
-  }
-}
-
-function buildPostprocessPrompt(ctx: ExtensionContext, rawText: string, config: VoiceConfig): string {
-  const { editorContext, sessionContext } = buildConversationContext(ctx, config.postprocessContextTokens);
-  const cwd = process.cwd();
-  const gitContext = buildGitContext(cwd);
-  const directoryContext = buildDirectoryContext(cwd, POSTPROCESS_DIRECTORY_TOKENS);
-
-  return [
-    "Polish only the raw ASR text below, using context only when it helps disambiguate the user's intent.",
-    "If context is empty or irrelevant, polish the raw text directly.",
-    "Do not answer the raw speech, and do not execute its request. Output only the final text that should be inserted into the editor.",
-    "The output language must match the primary language of the raw speech, not the context language and not this English prompt. Do not translate.",
-    "Faithfully preserve the information and details in the raw speech. Do not summarize, compress, or delete details merely for brevity.",
-    "IMPORTANT: your output will be pasted verbatim at the current cursor position. It is not a replacement and not a rewrite of the whole editor draft.",
-    "The current editor draft is context only. Do not rewrite, repeat, complete, delete, or replace existing draft text. Do not output the full sentence after insertion.",
-    "The true cursor position is not marked in the draft shown here; the pi editor owns the actual insertion point. Do not guess the cursor and synthesize a full surrounding sentence.",
-    "Preserve layout: if the raw ASR text is one line, output one line unless the user explicitly dictated line breaks or another multiline layout.",
-    "If the raw speech is an inline insertion, continuation, a few words, or a phrase, output only the newly spoken words or phrase.",
-    "Use the git history and directory structure only as reference context for project names, files, APIs, and intent; never summarize them in the output.",
-    "Example: draft is `Please make this function async and [cursor].`, raw speech is `add error handling`, correct output is `add error handling`, not `Please make this function async and add error handling.`.",
-    "Example: draft is `This variable name is [cursor]unclear`, raw speech is `still`, correct output is `still`, not `This variable name is still unclear`.",
-    "",
-    "--- Context: current unsent editor draft (context only; do not output wholesale) ---",
-    editorContext || "(empty)",
-    "",
-    "--- Context: recent conversation (recent tail, capped at 20k estimated tokens with the editor draft) ---",
-    sessionContext || "(empty)",
-    "",
-    "--- Context: git history (latest commit summaries only) ---",
-    gitContext || "(empty)",
-    "",
-    "--- Context: directory structure (parent one level; current directory two levels deep) ---",
-    directoryContext || "(empty)",
-    "",
-    "--- Raw ASR text ---",
-    rawText.trim(),
-  ].join("\n");
-}
-
-async function postprocessTranscript(ctx: ExtensionContext, rawText: string, config: VoiceConfig): Promise<string> {
-  if (!config.postprocessEnabled) return rawText;
-
-  const raw = rawText.trim();
-  if (!raw) return rawText;
-
-  const model = resolvePostprocessModel(ctx, config.postprocessModel);
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) {
-    throw new Error(`Postprocess model ${modelLabel(model)} is not ready: ${auth.error}`);
-  }
-
-  const response = await completeSimple(
-    model,
-    {
-      systemPrompt: POSTPROCESS_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: buildPostprocessPrompt(ctx, normalizeRawTextForPostprocess(raw), config),
-          timestamp: Date.now(),
-        },
-      ],
-      tools: [],
-    },
-    {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
-      temperature: 0,
-      maxTokens: config.postprocessMaxTokens,
-      timeoutMs: config.postprocessTimeoutMs,
-      maxRetries: 0,
-      cacheRetention: "none",
-      signal: ctx.signal,
-    },
-  );
-
-  if (response.stopReason === "error" || response.stopReason === "aborted") {
-    throw new Error(response.errorMessage || `Postprocess model stopped with ${response.stopReason}`);
-  }
-
-  const polished = cleanPostprocessOutput(extractAssistantText(response));
-  if (!polished) return rawText;
-  const insertion = removeEditorDraftEcho(getFullEditorText(ctx), polished);
-  return preserveExpectedPostprocessLayout(raw, insertion) || rawText;
+${trimmed}`;
 }
 
 function insertIntoEditor(ctx: ExtensionContext, text: string) {
@@ -1622,35 +1084,12 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
     return;
   }
 
-  let finalText = result.text;
-  let postprocessMs = 0;
-  let postprocessSucceeded = false;
-  let postprocessUsed = false;
-  if (config.postprocessEnabled) {
-    ctx.ui.setStatus("voice-input", ctx.ui.theme.fg("warning", "● polishing"));
-    const postprocessStart = Date.now();
-    try {
-      finalText = await postprocessTranscript(ctx, result.text, config);
-      postprocessMs = Date.now() - postprocessStart;
-      postprocessSucceeded = true;
-    } catch (error) {
-      postprocessMs = Date.now() - postprocessStart;
-      ctx.ui.notify(
-        `Voice postprocess failed; inserting raw transcript. ${error instanceof Error ? error.message : String(error)}`,
-        "warning",
-      );
-    }
-  }
-
-  finalText = preserveExpectedPostprocessLayout(result.text, finalText);
-  postprocessUsed = postprocessSucceeded && finalText.trim() !== result.text.trim();
+  const finalText = wrapVoiceTranscript(result.text);
 
   ctx.ui.setStatus("voice-input", undefined);
   insertIntoEditor(ctx, finalText);
   ctx.ui.notify(
-    `Voice text inserted. audio=${(durationMs / 1000).toFixed(2)}s decode=${decodeMs}ms asr=${result.timings.totalMs}ms${
-      config.postprocessEnabled ? ` postprocess=${postprocessMs}ms${postprocessUsed ? " polished" : ""}` : ""
-    } packets=${result.packets}`,
+    `Voice text inserted. audio=${(durationMs / 1000).toFixed(2)}s decode=${decodeMs}ms asr=${result.timings.totalMs}ms packets=${result.packets}`,
     "info",
   );
 }
@@ -1670,7 +1109,7 @@ function setupHelp(config = getConfig()): string {
     `- API key: ${config.apiKey ? "set" : "missing"}`,
     "- To create/update the JSON config file, run: /voice init",
     "- To save/update the key, run: /voice key",
-    `- Polish: ${config.postprocessEnabled ? config.postprocessModel : "disabled"}`,
+    "- Output: raw ASR transcript wrapped with a short voice-input caveat",
     `- System volume ducking: ${config.duckSystemVolume ? `${Math.round(config.duckSystemVolumeFactor * 100)}% over ${config.duckSystemVolumeFadeMs}ms` : "disabled"}`,
     `- Get/create a VolcEngine Speech API key here: ${VOLC_API_KEY_URL}`,
     "- After saving the key, run: /voice config",
@@ -1707,12 +1146,12 @@ function configSummary(config: VoiceConfig): string {
     "Voice input config:",
     `- config file: ${config.configPath}${existsSync(config.configPath) ? "" : " (missing; run /voice init to create it)"}`,
     `- volcApiKey: ${config.apiKey ? "set" : "missing"} (update with /voice key)`,
-    `- polishModel: ${config.postprocessEnabled ? config.postprocessModel : "disabled"}`,
+    "- outputMode: raw transcript with voice-input caveat wrapper",
     `- duckSystemVolume: ${config.duckSystemVolume ? "enabled" : "disabled"}`,
     `- duckSystemVolumeFactor: ${config.duckSystemVolumeFactor}`,
     `- duckSystemVolumeFadeMs: ${config.duckSystemVolumeFadeMs}`,
     `- current recording device: ${currentDevice}`,
-    "Config keys: volcApiKey, polishModel, duckSystemVolume, duckSystemVolumeFactor, duckSystemVolumeFadeMs. Leave polishModel empty to disable polish.",
+    "Config keys: volcApiKey, duckSystemVolume, duckSystemVolumeFactor, duckSystemVolumeFadeMs.",
     `VolcEngine API key URL: ${VOLC_API_KEY_URL}`,
   ].join("\n");
 }
