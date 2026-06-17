@@ -18,6 +18,7 @@ Typing long prompts can slow you down. `pi-voice-input` lets you:
 - **One-key dictation**: `Ctrl+Shift+R` starts recording; press it again to stop and insert text.
 - **Editor-safe workflow**: transcription is pasted into the current editor only. It does not auto-submit.
 - **Chinese/English mixed input**: handles prompts that switch between Chinese, English, product names, and technical terms.
+- **Hotword table support**: can pass a VolcEngine boosting table ID to improve recognition of project terms.
 - **Works on Linux and macOS**: uses common system recording tools.
 - **Lowers sound while you speak**: automatically turns down system audio during recording, then restores it afterwards.
 - **No hidden rewriting**: inserts the raw ASR transcript, prefixed with a short note that it may contain voice-recognition errors. If the editor already contains that note, later dictation inserts only the transcript.
@@ -105,11 +106,14 @@ User config keys are:
 ```json
 {
   "volcApiKey": "",
+  "boostingTableId": "",
   "duckSystemVolume": true,
   "duckSystemVolumeFactor": 0.5,
   "duckSystemVolumeFadeMs": 300
 }
 ```
+
+Set `boostingTableId` to a VolcEngine hotword/boosting table ID to send it as `boosting_table_id` on ASR requests. Leave it empty to disable hotword-table boosting. Boosting table name is not configured yet.
 
 ## System requirements
 
@@ -135,7 +139,7 @@ On macOS, allow microphone access for your terminal or pi host app when prompted
 ## Troubleshooting
 
 - Run `/voice status` to see whether recording is active.
-- Run `/voice config` to confirm the API key is detected.
+- Run `/voice config` to confirm the API key and optional boosting table ID are detected.
 - Run `/voice key` again if the key was changed or expired.
 - On macOS, check microphone permission if recording immediately fails.
 - On Linux, make sure `pw-record` or `arecord` is installed and your microphone works in other apps.

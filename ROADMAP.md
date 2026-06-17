@@ -7,6 +7,7 @@ This roadmap lists user-visible work planned for pi Voice Input. It is intention
 - Linux voice input through `pw-record` or `arecord`
 - macOS voice input through the system `afrecord` command
 - VolcEngine WebSocket ASR
+- Optional VolcEngine hotword boosting table ID
 - Raw ASR transcript insertion with a voice-input caveat wrapper
 
 ## Planned

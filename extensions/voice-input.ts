@@ -42,6 +42,7 @@ type JsonObject = Record<string, unknown>;
 
 type VoiceInputConfigFile = {
   volcApiKey: string;
+  boostingTableId: string;
   duckSystemVolume: boolean;
   duckSystemVolumeFactor: number;
   duckSystemVolumeFadeMs: number;
@@ -55,6 +56,7 @@ type VoiceConfig = {
   language: string;
   uid: string;
   prompt: string;
+  boostingTableId: string;
   segmentMs: number;
   requestTimeoutMs: number;
   finalizeDelayMs: number;
@@ -114,6 +116,7 @@ function ensureDir(dir: string) {
 function defaultConfigFile(): VoiceInputConfigFile {
   return {
     volcApiKey: "",
+    boostingTableId: "",
     duckSystemVolume: true,
     duckSystemVolumeFactor: 0.5,
     duckSystemVolumeFadeMs: 300,
@@ -148,6 +151,11 @@ function normalizeConfigFile(input: unknown): VoiceInputConfigFile {
   const root = isObject(input) ? input : {};
   return {
     volcApiKey: stringField(root, "volcApiKey", defaults.volcApiKey).trim(),
+    boostingTableId: stringField(
+      root,
+      "boostingTableId",
+      stringField(root, "boosting_table_id", defaults.boostingTableId),
+    ).trim(),
     duckSystemVolume: booleanField(root, "duckSystemVolume", defaults.duckSystemVolume),
     duckSystemVolumeFactor: clamp(numberField(root, "duckSystemVolumeFactor", defaults.duckSystemVolumeFactor), 0, 1),
     duckSystemVolumeFadeMs: Math.round(clamp(numberField(root, "duckSystemVolumeFadeMs", defaults.duckSystemVolumeFadeMs), 0, 3000)),
@@ -181,6 +189,7 @@ function getConfig(): VoiceConfig {
     language: "",
     uid: "pi-voice-input",
     prompt: "",
+    boostingTableId: fileConfig.boostingTableId,
     segmentMs: 5000,
     requestTimeoutMs: 90000,
     finalizeDelayMs: 100,
@@ -790,6 +799,7 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
       "X-Api-Resource-Id": config.resourceId,
       "X-Api-Connect-Id": connectId,
       "X-Api-Request-Id": connectId,
+      "X-Api-Sequence": "-1",
     },
     handshakeTimeout: 15_000,
   });
@@ -867,6 +877,10 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
     audioPayload.language = config.language;
   }
 
+  const corpusPayload: Record<string, unknown> = {};
+  if (config.boostingTableId) corpusPayload.boosting_table_id = config.boostingTableId;
+  if (config.prompt) corpusPayload.context = config.prompt;
+
   const requestPayload: Record<string, unknown> = {
     user: { uid: config.uid || "pi-voice-input" },
     audio: audioPayload,
@@ -877,7 +891,7 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
       enable_ddc: config.enableDdc,
       show_utterances: config.showUtterances,
       result_type: "full",
-      ...(config.prompt ? { corpus: { context: config.prompt } } : {}),
+      ...(Object.keys(corpusPayload).length ? { corpus: corpusPayload } : {}),
     },
   };
 
@@ -1108,6 +1122,7 @@ function setupHelp(config = getConfig()): string {
     "- Current provider: VolcEngine WebSocket ASR",
     `- Config file: ${config.configPath}`,
     `- API key: ${config.apiKey ? "set" : "missing"}`,
+    `- Hotword boosting table ID: ${config.boostingTableId ? "set" : "not set"}`,
     "- To create/update the JSON config file, run: /voice init",
     "- To save/update the key, run: /voice key",
     "- Output: raw ASR transcript wrapped with a short voice-input caveat",
@@ -1147,12 +1162,13 @@ function configSummary(config: VoiceConfig): string {
     "Voice input config:",
     `- config file: ${config.configPath}${existsSync(config.configPath) ? "" : " (missing; run /voice init to create it)"}`,
     `- volcApiKey: ${config.apiKey ? "set" : "missing"} (update with /voice key)`,
+    `- boostingTableId: ${config.boostingTableId ? "set" : "not set"}`,
     "- outputMode: raw transcript with voice-input caveat wrapper",
     `- duckSystemVolume: ${config.duckSystemVolume ? "enabled" : "disabled"}`,
     `- duckSystemVolumeFactor: ${config.duckSystemVolumeFactor}`,
     `- duckSystemVolumeFadeMs: ${config.duckSystemVolumeFadeMs}`,
     `- current recording device: ${currentDevice}`,
-    "Config keys: volcApiKey, duckSystemVolume, duckSystemVolumeFactor, duckSystemVolumeFadeMs.",
+    "Config keys: volcApiKey, boostingTableId, duckSystemVolume, duckSystemVolumeFactor, duckSystemVolumeFadeMs.",
     `VolcEngine API key URL: ${VOLC_API_KEY_URL}`,
   ].join("\n");
 }
