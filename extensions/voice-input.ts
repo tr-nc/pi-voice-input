@@ -26,11 +26,7 @@ const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apik
 // the local machine, so force those subprocesses to a known-local cwd.
 const LOCAL_AUDIO_PROCESS_CWD = homedir();
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
-const VOICE_TRANSCRIPT_NOTICE = [
-  "以下内容来自用户通过语音输入的原始转写，可能包含语音识别错误、错别字、同音词、断句或标点不准确，以及中英文、术语、代码名、文件名误识别等问题。",
-  "请明确注意：这段转写不一定完全准确。请结合上下文理解用户意图；必要时可以先澄清、翻译或推断，再继续处理。",
-  "原始语音转写如下：",
-].join("\n");
+const VOICE_TRANSCRIPT_NOTICE = "当前会话中的内容包含语音转写，可能存在识别错误；请结合上下文纠正，若不确定或明显偏离主题无法理解，请先询问用户。";
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
 const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
@@ -928,9 +924,14 @@ async function transcribePcm(pcm: Buffer, durationMs: number, config: VoiceConfi
   };
 }
 
-function wrapVoiceTranscript(rawText: string): string {
+function editorHasVoiceTranscriptNotice(editorText: string): boolean {
+  return editorText.replace(/\r\n/g, "\n").includes(VOICE_TRANSCRIPT_NOTICE);
+}
+
+function wrapVoiceTranscript(rawText: string, currentEditorText = ""): string {
   const trimmed = rawText.trim();
   if (!trimmed) return "";
+  if (editorHasVoiceTranscriptNotice(currentEditorText)) return trimmed;
   return `${VOICE_TRANSCRIPT_NOTICE}
 
 ${trimmed}`;
@@ -1084,7 +1085,7 @@ async function stopRecording(ctx: ExtensionContext, transcribe = true) {
     return;
   }
 
-  const finalText = wrapVoiceTranscript(result.text);
+  const finalText = wrapVoiceTranscript(result.text, ctx.ui.getEditorText());
 
   ctx.ui.setStatus("voice-input", undefined);
   insertIntoEditor(ctx, finalText);

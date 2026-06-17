@@ -20,7 +20,7 @@ Typing long prompts can slow you down. `pi-voice-input` lets you:
 - **Chinese/English mixed input**: handles prompts that switch between Chinese, English, product names, and technical terms.
 - **Works on Linux and macOS**: uses common system recording tools.
 - **Lowers sound while you speak**: automatically turns down system audio during recording, then restores it afterwards.
-- **No hidden rewriting**: inserts the raw ASR transcript, prefixed with a short note that it may contain voice-recognition errors.
+- **No hidden rewriting**: inserts the raw ASR transcript, prefixed with a short note that it may contain voice-recognition errors. If the editor already contains that note, later dictation inserts only the transcript.
 - **Simple setup commands**: configure from inside pi with `/voice init` and `/voice key`.
 
 Current speech provider: **VolcEngine Speech ASR**. A VolcEngine Speech API key is required.
@@ -98,7 +98,7 @@ Useful commands:
 
 ## Inserted text format
 
-The extension does not call a model to modify or translate your transcript. It inserts a short caveat telling the downstream model that the following text came from voice input and may contain recognition errors, then appends the raw ASR transcript unchanged.
+The extension does not call a model to modify or translate your transcript. It inserts a concise, location-neutral caveat saying the current conversation may include voice transcription errors, asking the model to correct them from context or ask the user if the meaning is unclear, then appends the raw ASR transcript unchanged. When you dictate multiple times in the same unsent editor draft, the caveat is kept to a single copy.
 
 User config keys are:
 
