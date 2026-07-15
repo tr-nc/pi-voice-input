@@ -26,7 +26,7 @@ const VOLC_API_KEY_URL = "https://console.volcengine.com/speech/new/setting/apik
 // the local machine, so force those subprocesses to a known-local cwd.
 const LOCAL_AUDIO_PROCESS_CWD = homedir();
 const DEFAULT_SHORTCUT = Key.ctrlShift("r");
-const VOICE_TRANSCRIPT_NOTICE = "当前会话中的内容包含语音转写，可能存在识别错误；请结合上下文纠正，若不确定或明显偏离主题无法理解，请先询问用户。";
+const VOICE_TRANSCRIPT_NOTICE = "Some content in this conversation was transcribed from speech and may contain recognition errors. Please correct any errors based on context. If the meaning is unclear or appears unrelated to the topic, ask the user for clarification before proceeding.";
 
 const MSG_TYPE_CLIENT_FULL_REQUEST = 0b0001;
 const MSG_TYPE_CLIENT_AUDIO_ONLY_REQUEST = 0b0010;
